@@ -1,0 +1,2 @@
+(this.webpackJsonp=this.webpackJsonp||[]).push([[156],{2826:function(t,s,a){"use strict";a.r(s),a.d(s,"loadAsyncModels",(function(){return e}));var n=a(151);const e=async t=>{const{getAsyncModels:s}=await Promise.resolve().then(a.bind(null,1307)),e=await s();await Promise.all(e.map(async s=>{let[a,e]=s;if("function"===typeof a){const s=await Object(n.b)({namespace:e});t.model(await a(s))}else t.model(a)}))}}}]);
+//# sourceMappingURL=156.chunk.2fd7496.js.map

@@ -1,0 +1,12 @@
+{
+  "name": "netease-cloud-music-linux-port",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron-based Linux host PoC for the extracted NetEase Cloud Music desktop frontend.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron --no-sandbox ./src/main.js",
+    "check": "node --check ./src/main.js && node --check ./src/preload.js && node --check ./src/native-api.js && node --check ./src/protocol.js",
+    "debug:boot": "bash ./scripts/debug-boot.sh"
+  }
+}
