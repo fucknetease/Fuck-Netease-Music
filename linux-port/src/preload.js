@@ -935,40 +935,115 @@ function installFetchBridge() {
 }
 
 function resolveWebpackRequire() {
-  try {
-    if (!Array.isArray(window.webpackJsonp) || typeof window.webpackJsonp.push !== "function") {
-      return null;
-    }
-    let req = null;
-    const probeChunkId = 910101;
-    const probeModuleId = 910102;
-    window.webpackJsonp.push([
-      [probeChunkId],
-      {
-        [probeModuleId]: function captureWebpackRequire(module, exports, nextRequire) {
-          req = nextRequire;
-        }
-      },
-      [[probeModuleId]]
-    ]);
-    return req;
-  } catch (error) {
-    reportRendererError("bootstrap-webpack-probe-failed", {
-      message: error.message,
-      stack: error.stack || null
-    });
+  return typeof window.__webpack_require__ === "function" ? window.__webpack_require__ : null;
+}
+
+function readStoreFromCandidate(candidate) {
+  if (!candidate || typeof candidate !== "object") {
     return null;
   }
+
+  const possibleStores = [
+    candidate,
+    candidate._store,
+    candidate.store,
+    candidate.app?._store,
+    candidate.app?.store
+  ];
+
+  for (const store of possibleStores) {
+    if (
+      store &&
+      typeof store.getState === "function" &&
+      typeof store.dispatch === "function"
+    ) {
+      return store;
+    }
+  }
+
+  if (typeof candidate.getAppContext === "function") {
+    try {
+      const appContext = candidate.getAppContext();
+      const store = readStoreFromCandidate(appContext);
+      if (store) {
+        return store;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function resolveAppStoreFromWebpackCache(req) {
+  const moduleCache = req?.c;
+  if (!moduleCache || typeof moduleCache !== "object") {
+    return null;
+  }
+
+  for (const cachedModule of Object.values(moduleCache)) {
+    const exportsObject = cachedModule?.exports;
+    const store =
+      readStoreFromCandidate(exportsObject) ||
+      readStoreFromCandidate(exportsObject?.default) ||
+      readStoreFromCandidate(exportsObject?.a);
+    if (store) {
+      return store;
+    }
+  }
+
+  return null;
+}
+
+function resolveAppStoreFromWindowGlobals() {
+  const globalCandidates = [];
+
+  if (window.g_app) {
+    globalCandidates.push(window.g_app);
+  }
+  if (window.__INITIAL_STATE__) {
+    globalCandidates.push(window.__INITIAL_STATE__);
+  }
+
+  for (const key of Object.getOwnPropertyNames(window)) {
+    if (key === "window" || key === "self" || key === "globalThis") {
+      continue;
+    }
+    let value = null;
+    try {
+      value = window[key];
+    } catch {
+      continue;
+    }
+    if (!value || (typeof value !== "object" && typeof value !== "function")) {
+      continue;
+    }
+    globalCandidates.push(value);
+  }
+
+  for (const candidate of globalCandidates) {
+    const store =
+      readStoreFromCandidate(candidate) ||
+      readStoreFromCandidate(candidate?.default) ||
+      readStoreFromCandidate(candidate?.a);
+    if (store) {
+      return store;
+    }
+  }
+
+  return null;
 }
 
 function resolveAppStore() {
   try {
+    const globalStore = resolveAppStoreFromWindowGlobals();
+    if (globalStore) {
+      return globalStore;
+    }
     const req = resolveWebpackRequire();
-    const dvaTool = req?.(11)?.a;
-    const store = dvaTool?.app?._store;
-    return store && typeof store.getState === "function" && typeof store.dispatch === "function"
-      ? store
-      : null;
+    if (!req) {
+      return null;
+    }
+    return resolveAppStoreFromWebpackCache(req);
   } catch (error) {
     reportRendererError("bootstrap-store-probe-failed", {
       message: error.message,
