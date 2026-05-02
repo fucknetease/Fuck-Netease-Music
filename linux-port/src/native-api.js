@@ -454,6 +454,22 @@ function normalizeFetchPayload(payload) {
   };
 }
 
+function guessFileExtensionFromUrl(inputUrl, fallbackExtension = ".bin") {
+  if (typeof inputUrl !== "string" || !inputUrl) {
+    return fallbackExtension;
+  }
+  try {
+    const parsed = new URL(inputUrl);
+    const extension = path.extname(parsed.pathname || "");
+    if (!extension || extension.length > 10) {
+      return fallbackExtension;
+    }
+    return extension.toLowerCase();
+  } catch {
+    return fallbackExtension;
+  }
+}
+
 function rewriteRpcUrl(url) {
   const rewrites = [
     ["/eapi/comment/pc/song/mode/initial/carousel", "/api/comment/pc/song/mode/initial/carousel"],
@@ -2161,6 +2177,52 @@ function createNativeApi(options) {
         status: response.status,
         text
       };
+    },
+    "linuxport.prepareaudio": async (payload = {}) => {
+      const rawUrl =
+        payload && typeof payload === "object" ? payload.url || payload.musicurl || "" : "";
+      const normalizedUrl = normalizeAssetUrl(String(rawUrl || ""));
+      if (!/^https:\/\/[^/]+\.music\.126\.net(\/|$)/i.test(normalizedUrl)) {
+        return "";
+      }
+
+      const cacheDir = path.join(tempRoot, "prepared-audio");
+      await ensureDir(cacheDir);
+      const extension = guessFileExtensionFromUrl(normalizedUrl, ".bin");
+      const filePath = path.join(cacheDir, `${hashString(normalizedUrl)}${extension}`);
+
+      try {
+        const stat = await fsp.stat(filePath);
+        if (stat.isFile() && stat.size > 0) {
+          return filePath;
+        }
+      } catch {
+        // ignore cache miss and re-download below
+      }
+
+      const headers = {
+        Origin: "https://music.163.com",
+        origin: "https://music.163.com",
+        Referer: "https://music.163.com/",
+        referer: "https://music.163.com/",
+        Accept: "audio/*,*/*;q=0.9"
+      };
+      const cookies = await session.defaultSession.cookies.get({ url: normalizedUrl });
+      if (cookies.length > 0) {
+        headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+      }
+
+      const response = await fetch(normalizedUrl, {
+        method: "GET",
+        headers
+      });
+      if (!response.ok) {
+        throw new Error(`prepareaudio failed: ${response.status}`);
+      }
+
+      const bytes = Buffer.from(await response.arrayBuffer());
+      await fsp.writeFile(filePath, bytes);
+      return filePath;
     },
     "storage.imagesinfo": async () => [],
     "storage.execsql": async (requestIdOrSql = "", sqlText = "") => {

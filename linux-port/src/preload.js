@@ -207,20 +207,36 @@ function readPlayableUrl(payload = {}) {
   return "";
 }
 
+function readPlayableInfo(payload = {}) {
+  const playInfoString =
+    payload && typeof payload.playInfoStr === "string" ? payload.playInfoStr : "";
+  return playInfoString ? safeParseJson(playInfoString, null) : null;
+}
+
+function shouldPrepareLocalPlayback(payload = {}, normalizedUrl = "") {
+  if (!normalizedUrl) {
+    return false;
+  }
+  if (/\.flac(?:$|\?)/i.test(normalizedUrl)) {
+    return true;
+  }
+  const playInfo = readPlayableInfo(payload);
+  const level = String(
+    payload.level ||
+      payload.soundQuality ||
+      payload.audioFormat ||
+      playInfo?.level ||
+      playInfo?.type ||
+      ""
+  ).toLowerCase();
+  return level === "lossless" || level === "flac";
+}
+
 function normalizePlayableUrl(url) {
   if (typeof url !== "string" || !url) {
     return "";
   }
-  const normalizedUrl = url.replace(/^http:\/\//i, "https://");
-  try {
-    const target = new URL(normalizedUrl);
-    if (/^https:$/.test(target.protocol) && /(^|\.)music\.126\.net$/i.test(target.hostname)) {
-      return `orpheus://media/audio?url=${encodeURIComponent(normalizedUrl)}`;
-    }
-  } catch {
-    return normalizedUrl;
-  }
-  return normalizedUrl;
+  return url.replace(/^http:\/\//i, "https://");
 }
 
 function createLocalAudioBridge() {
@@ -233,6 +249,7 @@ function createLocalAudioBridge() {
   let lastVolume = 1;
   let lastPlaybackRate = 1;
   let pendingSeekSeconds = null;
+  const preparedPlayableSourceCache = new Map();
 
   const PLAY_STATE = {
     play: 0,
@@ -415,10 +432,49 @@ function createLocalAudioBridge() {
     return audioElement;
   };
 
+  const toOrpheusFileUrl = (filePath) =>
+    filePath ? `orpheus://file/${encodeURIComponent(String(filePath))}` : "";
+
+  const resolvePreparedPlayableSource = async (payload = {}) => {
+    const directUrl = normalizePlayableUrl(readPlayableUrl(payload));
+    if (!directUrl) {
+      return "";
+    }
+    if (!shouldPrepareLocalPlayback(payload, directUrl)) {
+      return directUrl;
+    }
+
+    const existingTask = preparedPlayableSourceCache.get(directUrl);
+    if (existingTask) {
+      return existingTask;
+    }
+
+    const prepareTask = invokeNative("linuxport.prepareaudio", [{ url: directUrl }])
+      .then((filePath) => {
+        const localUrl = toOrpheusFileUrl(filePath);
+        return localUrl || directUrl;
+      })
+      .catch((error) => {
+        reportRendererError("prepare-lossless-audio-failed", {
+          message: error?.message || String(error),
+          url: directUrl
+        });
+        preparedPlayableSourceCache.delete(directUrl);
+        return directUrl;
+      });
+
+    preparedPlayableSourceCache.set(directUrl, prepareTask);
+    const resolved = await prepareTask;
+    if (resolved === directUrl) {
+      preparedPlayableSourceCache.delete(directUrl);
+    }
+    return resolved;
+  };
+
   const localHandlers = {
     "audioplayer.load": async (playId, payload = {}) => {
       const audio = ensureAudioElement();
-      const nextUrl = normalizePlayableUrl(readPlayableUrl(payload));
+      const nextUrl = await resolvePreparedPlayableSource(payload);
       currentPlayId = String(playId || payload.playId || "");
       currentResumeOrPauseId = "";
       currentSeekId = "";
@@ -499,7 +555,7 @@ function createLocalAudioBridge() {
     },
     "audioplayer.preload": async (_playId, payload = {}) => {
       const audio = ensureAudioElement();
-      const nextUrl = normalizePlayableUrl(readPlayableUrl(payload));
+      const nextUrl = await resolvePreparedPlayableSource(payload);
       if (!nextUrl) {
         return false;
       }

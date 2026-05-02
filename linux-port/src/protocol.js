@@ -99,45 +99,6 @@ function createTextResponse(contents, contentType) {
   });
 }
 
-function isProxyableAudioUrl(input) {
-  if (typeof input !== "string" || !input) {
-    return false;
-  }
-  try {
-    const target = new URL(input);
-    return /^https:$/.test(target.protocol) && /(^|\.)music\.126\.net$/i.test(target.hostname);
-  } catch {
-    return false;
-  }
-}
-
-async function createAudioProxyResponse(request, electronNet) {
-  const url = new URL(request.url);
-  const targetUrl = decodeURIComponent(url.searchParams.get("url") || "");
-  if (!isProxyableAudioUrl(targetUrl)) {
-    return new Response("invalid audio proxy target", {
-      status: 400,
-      headers: {
-        "content-type": "text/plain; charset=utf-8"
-      }
-    });
-  }
-
-  const requestHeaders = {};
-  const rangeHeader = request.headers.get("range");
-  if (rangeHeader) {
-    requestHeaders.Range = rangeHeader;
-  }
-  requestHeaders.Accept = request.headers.get("accept") || "*/*";
-  requestHeaders.Origin = "https://music.163.com";
-  requestHeaders.Referer = "https://music.163.com/";
-
-  return electronNet.fetch(targetUrl, {
-    method: "GET",
-    headers: requestHeaders
-  });
-}
-
 async function createFileResponse(electronNet, filePath) {
   return electronNet.fetch(pathToFileURL(filePath).toString());
 }
@@ -163,11 +124,6 @@ async function handleOrpheusRequest(request, electronNet, nativeApi) {
   }
 
   switch (url.host) {
-    case "media":
-      if (url.pathname === "/audio") {
-        return createAudioProxyResponse(request, electronNet);
-      }
-      break;
     case "native":
       resolvedFile = resolveNativeAsset(nativeApi.assetRoot, url.pathname);
       if (!resolvedFile && FALLBACK_PAGES[url.pathname]) {
