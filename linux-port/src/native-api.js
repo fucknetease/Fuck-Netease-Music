@@ -114,12 +114,16 @@ function maybeRepairUtf8Mojibake(value) {
 
 function normalizeDataValue(value) {
   if (typeof value === "string") {
-    return normalizeJsonText(maybeRepairUtf8Mojibake(value));
+    return normalizeAssetUrl(normalizeJsonText(maybeRepairUtf8Mojibake(value)));
   }
   if (Array.isArray(value)) {
     return value.map((item) => normalizeDataValue(item));
   }
   if (value && typeof value === "object") {
+    const normalizedEcpmPayload = normalizeHomePageEcpmPayload(value);
+    if (normalizedEcpmPayload !== value) {
+      return normalizeDataValue(normalizedEcpmPayload);
+    }
     const output = {};
     for (const [key, entry] of Object.entries(value)) {
       output[key] = normalizeDataValue(entry);
@@ -127,6 +131,164 @@ function normalizeDataValue(value) {
     return output;
   }
   return value;
+}
+
+function normalizeAssetUrl(value) {
+  if (typeof value !== "string" || !value) {
+    return value;
+  }
+
+  if (/^\/\//.test(value)) {
+    return `https:${value}`;
+  }
+
+  if (/^http:\/\/[^/\s]+\.(music\.126\.net|music\.163\.com|126\.net|netease\.com)(\/|$)/i.test(value)) {
+    return value.replace(/^http:\/\//i, "https://");
+  }
+
+  return value;
+}
+
+function normalizeEcpmBlockEntry(blockName, blockValue) {
+  const fallbackTitles = {
+    featureRecommendBlock: "每日推荐",
+    recommendPlaylistBlock: "推荐歌单",
+    bannersBlock: "精选活动",
+    ranklistBlock: "排行榜",
+    allListenBlock: "大家都在听",
+    recentListenBlock: "最近在听",
+    heartbeatRecommendBlock: "红心推荐",
+    radarBlock: "私人雷达",
+    vipRecommendBlock: "会员推荐",
+    styleRecommendBlock: "风格推荐",
+    dailyVoiceBlock: "每日播客",
+    personalizeVoiceListBlock: "热门播客",
+    listenAudioBookBlock: "听见好书"
+  };
+
+  const normalizedBlock =
+    blockValue && typeof blockValue === "object" && !Array.isArray(blockValue)
+      ? { ...blockValue }
+      : {};
+
+  if (blockName === "bannersBlock") {
+    return {
+      ...normalizedBlock,
+      title: "",
+      data: [],
+      alg: ""
+    };
+  }
+
+  if (typeof normalizedBlock.title !== "string" || !normalizedBlock.title) {
+    const nestedTitle =
+      normalizedBlock.data &&
+      typeof normalizedBlock.data === "object" &&
+      !Array.isArray(normalizedBlock.data)
+        ? normalizedBlock.data.blockName ||
+          normalizedBlock.data.title ||
+          normalizedBlock.data.uiElement?.mainTitle?.title ||
+          ""
+        : "";
+    normalizedBlock.title = nestedTitle || fallbackTitles[blockName] || "";
+  }
+
+  if (typeof normalizedBlock.alg !== "string") {
+    normalizedBlock.alg = normalizedBlock.alg ? String(normalizedBlock.alg) : "";
+  }
+
+  if (
+    blockName === "listenAudioBookBlock" &&
+    normalizedBlock.data &&
+    typeof normalizedBlock.data === "object" &&
+    !Array.isArray(normalizedBlock.data) &&
+    Array.isArray(normalizedBlock.data.creatives)
+  ) {
+    normalizedBlock.data = normalizedBlock.data.creatives;
+  }
+
+  if (typeof normalizedBlock.data === "undefined" || normalizedBlock.data === null) {
+    normalizedBlock.data = [];
+  }
+
+  return normalizedBlock;
+}
+
+function normalizeHomePageEcpmPayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+
+  const blockKeys = [
+    "featureRecommendBlock",
+    "recommendPlaylistBlock",
+    "bannersBlock",
+    "ranklistBlock",
+    "allListenBlock",
+    "recentListenBlock",
+    "heartbeatRecommendBlock",
+    "radarBlock",
+    "vipRecommendBlock",
+    "styleRecommendBlock",
+    "dailyVoiceBlock",
+    "personalizeVoiceListBlock",
+    "listenAudioBookBlock"
+  ];
+
+  if (!blockKeys.some((key) => key in value)) {
+    return value;
+  }
+
+  const normalized = { ...value };
+  for (const key of blockKeys) {
+    normalized[key] = normalizeEcpmBlockEntry(key, normalized[key]);
+  }
+  if (Array.isArray(normalized.homePageEcpmOrderedBlocks)) {
+    normalized.homePageEcpmOrderedBlocks = normalized.homePageEcpmOrderedBlocks.filter(
+      (blockName) => blockName !== "bannersBlock"
+    );
+  }
+  if (Array.isArray(normalized.orderedBlocks)) {
+    normalized.orderedBlocks = normalized.orderedBlocks.filter(
+      (blockName) => blockName !== "bannersBlock"
+    );
+  }
+  return normalized;
+}
+
+function sanitizeHomePageEcpmCachePayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+
+  const nextValue = { ...value };
+  if (nextValue.homePageEcpmResourceDatas) {
+    nextValue.homePageEcpmResourceDatas = normalizeHomePageEcpmPayload(
+      nextValue.homePageEcpmResourceDatas
+    );
+  }
+  if (Array.isArray(nextValue.homePageEcpmOrderedBlocks)) {
+    nextValue.homePageEcpmOrderedBlocks = nextValue.homePageEcpmOrderedBlocks.filter(
+      (blockName) => blockName !== "bannersBlock"
+    );
+  }
+  return nextValue;
+}
+
+function sanitizeHomePageEcpmCacheText(text) {
+  if (typeof text !== "string" || !text.trim()) {
+    return text;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+
+  const sanitized = sanitizeHomePageEcpmCachePayload(parsed);
+  return sanitized === parsed ? text : JSON.stringify(sanitized);
 }
 
 function deepEqualJsonLike(left, right) {
@@ -1213,6 +1375,13 @@ function createNativeApi(options) {
 
   normalizePersistentHostModelRow();
   normalizePersistentModelRecordSync("page:audio");
+  normalizePersistentModelRecordSync("homePageEcpm");
+
+  const isHomePageEcpmStoragePath = (targetPath = "") =>
+    typeof targetPath === "string" && /(^|\/)homePageEcpm$/.test(targetPath.replace(/\\/g, "/"));
+
+  const maybeSanitizeHomePageEcpmStorageText = (targetPath, text) =>
+    isHomePageEcpmStoragePath(targetPath) ? sanitizeHomePageEcpmCacheText(text) : text;
 
   function saveLocalConfig() {
     fs.writeFileSync(localConfigPath, JSON.stringify(localConfig, null, 2));
@@ -1814,12 +1983,16 @@ function createNativeApi(options) {
       ) {
         const resolvedTarget = storageTargetFromPathMode(pathMode, targetPath);
         const content = resolvedTarget ? await readTextFile(resolvedTarget) : "";
-        emitNativeEvent("storage.onreadfromfiledone", requestIdOrPayload, 0, content);
-        return content;
+        const sanitizedContent = maybeSanitizeHomePageEcpmStorageText(targetPath, content);
+        emitNativeEvent("storage.onreadfromfiledone", requestIdOrPayload, 0, sanitizedContent);
+        return sanitizedContent;
       }
       const payload = requestIdOrPayload || {};
       const resolvedTarget = normalizeStorageTarget(payload.path);
-      return resolvedTarget ? readTextFile(resolvedTarget) : "";
+      if (!resolvedTarget) {
+        return "";
+      }
+      return maybeSanitizeHomePageEcpmStorageText(payload.path, await readTextFile(resolvedTarget));
     },
     "storage.savetofile": async (
       requestIdOrPayload,
@@ -1839,7 +2012,10 @@ function createNativeApi(options) {
           emitNativeEvent("storage.onsavetofiledone", requestIdOrPayload, 1);
           return false;
         }
-        await writeTextFile(resolvedTarget, content || "");
+        await writeTextFile(
+          resolvedTarget,
+          maybeSanitizeHomePageEcpmStorageText(targetPath, content || "")
+        );
         emitNativeEvent("storage.onsavetofiledone", requestIdOrPayload, 0);
         return true;
       }
@@ -1848,18 +2024,27 @@ function createNativeApi(options) {
       if (!resolvedTarget) {
         return "";
       }
-      return writeTextFile(resolvedTarget, payload.content || "");
+      return writeTextFile(
+        resolvedTarget,
+        maybeSanitizeHomePageEcpmStorageText(payload.path, payload.content || "")
+      );
     },
     "storage.writefile": async (payload = {}) => {
       const targetPath = normalizeStorageTarget(payload.path);
       if (!targetPath) {
         return "";
       }
-      return writeTextFile(targetPath, payload.content || "");
+      return writeTextFile(
+        targetPath,
+        maybeSanitizeHomePageEcpmStorageText(payload.path, payload.content || "")
+      );
     },
     "storage.readfile": async (payload = {}) => {
       const targetPath = normalizeStorageTarget(payload.path);
-      return targetPath ? readTextFile(targetPath) : "";
+      if (!targetPath) {
+        return "";
+      }
+      return maybeSanitizeHomePageEcpmStorageText(payload.path, await readTextFile(targetPath));
     },
     "storage.deletefile": async (
       requestIdOrPayload,
