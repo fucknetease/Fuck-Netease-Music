@@ -5,6 +5,7 @@ const { pathToFileURL } = require("node:url");
 
 const registeredCallbacks = new Map();
 const debugEventCounters = new Map();
+const DOWNLOAD_PROCESS_EVENT = "__netease_linux_download_process__";
 const bootstrapLocalStorageDefaults = {
   setting: {
     downloadDir: "",
@@ -179,19 +180,21 @@ function buildDownloadProcessCallbackVariants(args) {
     return [args];
   }
 
-  return [[
-    payload,
-    payload,
-    payload.id,
-    payload.type,
-    Boolean(payload.isLast),
-    payload.relativePath,
-    payload.down,
-    payload.total,
-    payload.speed,
-    payload.path,
-    payload.nativeType
-  ]];
+  return [
+    [
+      payload.id,
+      payload,
+      payload.type,
+      Boolean(payload.isLast),
+      payload.relativePath,
+      payload.down,
+      payload.total,
+      payload.speed,
+      payload.path,
+      payload.nativeType
+    ],
+    [payload]
+  ];
 }
 
 function buildRegisteredCallbackArgs(name, matchedName, args) {
@@ -234,35 +237,11 @@ function resolveDownloadResourceRecord(state, offlineId) {
   return targetMap.get(parsed.resourceId) || null;
 }
 
-function shouldDispatchDownloadFallback(payload) {
-  const parsed = parseDownloadOfflineId(payload?.id);
-  if (!parsed) {
-    return false;
-  }
-
-  const store = resolveAppStore();
-  if (!store || typeof store.getState !== "function") {
-    return false;
-  }
-
-  const state = store.getState() || {};
-  const resource = resolveDownloadResourceRecord(state, payload.id);
-  const progress = Number(resource?.download?.progress ?? 0);
-  const speed = Number(resource?.download?.speed ?? 0);
-  const hasPath = Boolean(resource?.path);
-
-  if (payload.isLast) {
-    return !hasPath && progress < 0.9;
-  }
-
-  if (payload.down > 0 && payload.total > 0) {
-    return progress <= 0 && speed <= 0;
-  }
-
-  return false;
-}
-
 function dispatchDownloadFallback(payload) {
+  if (!parseDownloadOfflineId(payload?.id)) {
+    return false;
+  }
+
   const store = resolveAppStore();
   if (!store || typeof store.dispatch !== "function") {
     return false;
@@ -292,6 +271,20 @@ function dispatchDownloadFallback(payload) {
   } catch (error) {
     console.error("[bridge:event:download-fallback-error]", error);
     return false;
+  }
+}
+
+function emitDownloadProcessEvent(payload) {
+  try {
+    window.dispatchEvent(
+      new CustomEvent(DOWNLOAD_PROCESS_EVENT, {
+        detail: payload
+      })
+    );
+  } catch (error) {
+    if (shouldLogLimitedDebug("download.onProcess:emit-error")) {
+      console.error("[bridge:event:download-emit-error]", error);
+    }
   }
 }
 
@@ -326,14 +319,18 @@ function runRegisteredCallbacks(name, args) {
       for (const variantArgs of variants) {
         try {
           if (name === "download.onProcess" && shouldLogLimitedDebug("download.onProcess:variant")) {
-            const payload = variantArgs[0];
+            const id = variantArgs[0];
+            const payload =
+              variantArgs[1] && typeof variantArgs[1] === "object" ? variantArgs[1] : variantArgs[0];
             console.log(
               "[bridge:event:download-variant]",
               matchedName,
               Array.isArray(variantArgs) ? variantArgs.length : 0,
+              typeof id,
               typeof payload,
               payload && typeof payload === "object"
                 ? JSON.stringify({
+                    idArg: typeof id === "string" ? id : null,
                     id: payload.id,
                     type: payload.type,
                     nativeType: payload.nativeType,
@@ -370,7 +367,8 @@ function runRegisteredCallbacks(name, args) {
 
   if (name === "download.onProcess") {
     const payload = normalizeDownloadProcessPayload(args[0]);
-    if (payload && typeof payload === "object" && shouldDispatchDownloadFallback(payload)) {
+    if (payload && typeof payload === "object") {
+      emitDownloadProcessEvent(payload);
       dispatchDownloadFallback(payload);
     }
   }
@@ -406,6 +404,71 @@ function safeParseJson(value, fallbackValue) {
   } catch {
     return fallbackValue;
   }
+}
+
+function patchDownloadObservableModule(moduleTable) {
+  if (!moduleTable || typeof moduleTable !== "object") {
+    return;
+  }
+
+  const originalFactory = moduleTable[1315];
+  if (typeof originalFactory !== "function" || originalFactory.__LINUX_PATCHED__) {
+    return;
+  }
+
+  const patchedFactory = function patchedDownloadObservableModule(e, o, t) {
+    "use strict";
+    t.d(o, "a", function exportObservable() {
+      return c;
+    });
+    var a = t(4),
+      l = t(22),
+      n = t(58);
+    const c = Object(n.a)(
+      (callback) =>
+        window.__NETEASE_LINUX_PORT__ &&
+        window.__NETEASE_LINUX_PORT__.subscribeDownloadProcess
+          ? window.__NETEASE_LINUX_PORT__.subscribeDownloadProcess(callback)
+          : a.Download.subscribeProcess(callback),
+      () => {}
+    ).pipe(
+      Object(l.map)((eventArgs) => {
+        let [payload] = eventArgs;
+        return payload;
+      })
+    );
+  };
+
+  patchedFactory.__LINUX_PATCHED__ = true;
+  patchedFactory.__LINUX_PATCHED_FROM__ = originalFactory;
+  moduleTable[1315] = patchedFactory;
+  console.log("[linux:patch] download observable module patched");
+}
+
+function patchWebpackChunkEntry(chunkEntry) {
+  if (!Array.isArray(chunkEntry) || chunkEntry.length < 2) {
+    return;
+  }
+
+  patchDownloadObservableModule(chunkEntry[1]);
+}
+
+function installWebpackChunkPatch() {
+  const queue = Array.isArray(window.webpackJsonp) ? window.webpackJsonp : [];
+
+  for (const chunkEntry of queue) {
+    patchWebpackChunkEntry(chunkEntry);
+  }
+
+  const originalPush = typeof queue.push === "function" ? queue.push.bind(queue) : Array.prototype.push.bind(queue);
+  queue.push = function patchedWebpackJsonpPush(...entries) {
+    for (const entry of entries) {
+      patchWebpackChunkEntry(entry);
+    }
+    return originalPush(...entries);
+  };
+
+  window.webpackJsonp = queue;
 }
 
 function normalizePathValue(value) {
@@ -1730,6 +1793,21 @@ const bridge = {
   }
 };
 
+function subscribeDownloadProcess(callback) {
+  if (typeof callback !== "function") {
+    return () => {};
+  }
+
+  const handler = (event) => {
+    callback(event?.detail);
+  };
+
+  window.addEventListener(DOWNLOAD_PROCESS_EVENT, handler);
+  return () => {
+    window.removeEventListener(DOWNLOAD_PROCESS_EVENT, handler);
+  };
+}
+
 const channel = {
   call(name, callback, argsLike) {
     const args = Array.isArray(argsLike) ? argsLike : Array.from(argsLike || []);
@@ -1836,12 +1914,14 @@ window.Bridge = bridge;
 window.__NETEASE_LINUX_PORT__ = {
   channel,
   invokeNative,
-  Bridge: bridge
+  Bridge: bridge,
+  subscribeDownloadProcess
 };
 
 seedLocalStorageDefaults();
 installSessionBootstrapBridge();
 installFetchBridge();
+installWebpackChunkPatch();
 installRendererCompatibilityBootstrap();
 installReactDomProbe();
 
@@ -1866,4 +1946,5 @@ window.addEventListener("unhandledrejection", (event) => {
 if (process.contextIsolated) {
   contextBridge.exposeInMainWorld("channel", channel);
   contextBridge.exposeInMainWorld("Bridge", bridge);
+  contextBridge.exposeInMainWorld("__NETEASE_LINUX_PORT__", window.__NETEASE_LINUX_PORT__);
 }
