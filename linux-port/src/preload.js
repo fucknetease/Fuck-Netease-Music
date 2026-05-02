@@ -211,7 +211,16 @@ function normalizePlayableUrl(url) {
   if (typeof url !== "string" || !url) {
     return "";
   }
-  return url.replace(/^http:\/\//i, "https://");
+  const normalizedUrl = url.replace(/^http:\/\//i, "https://");
+  try {
+    const target = new URL(normalizedUrl);
+    if (/^https:$/.test(target.protocol) && /(^|\.)music\.126\.net$/i.test(target.hostname)) {
+      return `orpheus://media/audio?url=${encodeURIComponent(normalizedUrl)}`;
+    }
+  } catch {
+    return normalizedUrl;
+  }
+  return normalizedUrl;
 }
 
 function createLocalAudioBridge() {
@@ -222,6 +231,8 @@ function createLocalAudioBridge() {
   let progressTimer = null;
   let lastPayload = null;
   let lastVolume = 1;
+  let lastPlaybackRate = 1;
+  let pendingSeekSeconds = null;
 
   const PLAY_STATE = {
     play: 0,
@@ -236,9 +247,29 @@ function createLocalAudioBridge() {
 
     audioElement = document.createElement("audio");
     audioElement.preload = "auto";
-    audioElement.crossOrigin = "anonymous";
     audioElement.style.display = "none";
     audioElement.volume = lastVolume;
+    audioElement.playbackRate = lastPlaybackRate;
+    audioElement.defaultPlaybackRate = lastPlaybackRate;
+
+    const applyPendingSeek = () => {
+      if (!audioElement || pendingSeekSeconds === null) {
+        return;
+      }
+      if (!Number.isFinite(pendingSeekSeconds) || pendingSeekSeconds < 0) {
+        pendingSeekSeconds = null;
+        return;
+      }
+      if (audioElement.readyState < 1 || !Number.isFinite(audioElement.duration)) {
+        return;
+      }
+      const boundedTime = Math.min(
+        pendingSeekSeconds,
+        audioElement.duration > 0 ? audioElement.duration : pendingSeekSeconds
+      );
+      pendingSeekSeconds = null;
+      audioElement.currentTime = boundedTime;
+    };
 
     const mount = () => {
       if (document.body && audioElement && !audioElement.isConnected) {
@@ -292,6 +323,7 @@ function createLocalAudioBridge() {
     };
 
     audioElement.addEventListener("loadedmetadata", () => {
+      applyPendingSeek();
       runRegisteredCallbacks("audioplayer.onLoad", [
         currentPlayId,
         {
@@ -362,6 +394,10 @@ function createLocalAudioBridge() {
       runRegisteredCallbacks("audioplayer.onBuffering", [currentPlayId, false]);
     });
 
+    audioElement.addEventListener("canplay", () => {
+      applyPendingSeek();
+    });
+
     audioElement.addEventListener("timeupdate", () => {
       emitPlayProgress(false);
     });
@@ -387,6 +423,7 @@ function createLocalAudioBridge() {
       currentResumeOrPauseId = "";
       currentSeekId = "";
       lastPayload = payload && typeof payload === "object" ? { ...payload } : null;
+      pendingSeekSeconds = null;
 
       if (!nextUrl) {
         runRegisteredCallbacks("audioplayer.onLoad", [
@@ -397,7 +434,11 @@ function createLocalAudioBridge() {
       }
 
       audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
       audio.src = nextUrl;
+      audio.playbackRate = lastPlaybackRate;
+      audio.defaultPlaybackRate = lastPlaybackRate;
       audio.currentTime = 0;
       audio.load();
       return true;
@@ -445,7 +486,15 @@ function createLocalAudioBridge() {
         runRegisteredCallbacks("audioplayer.onSeek", [currentPlayId, currentSeekId, -1, 0]);
         return false;
       }
-      audio.currentTime = nextTimeSeconds;
+      if (audio.readyState < 1 || !Number.isFinite(audio.duration)) {
+        pendingSeekSeconds = nextTimeSeconds;
+        return true;
+      }
+      pendingSeekSeconds = null;
+      audio.currentTime = Math.min(
+        nextTimeSeconds,
+        audio.duration > 0 ? audio.duration : nextTimeSeconds
+      );
       return true;
     },
     "audioplayer.preload": async (_playId, payload = {}) => {
@@ -459,6 +508,24 @@ function createLocalAudioBridge() {
         audio.src = nextUrl;
         audio.load();
       }
+      return true;
+    },
+    "audioplayer.setplaybackrate": async (...args) => {
+      const audio = ensureAudioElement();
+      let nextRateRaw = 1;
+      for (let index = args.length - 1; index >= 0; index -= 1) {
+        if (Number.isFinite(Number(args[index]))) {
+          nextRateRaw = args[index];
+          break;
+        }
+      }
+      const nextRate = Number(nextRateRaw || 1);
+      if (!Number.isFinite(nextRate) || nextRate <= 0) {
+        return false;
+      }
+      lastPlaybackRate = nextRate;
+      audio.playbackRate = nextRate;
+      audio.defaultPlaybackRate = nextRate;
       return true;
     },
     "audioplayer.setvolume": async (_playId, _volumeId, value = 100) => {

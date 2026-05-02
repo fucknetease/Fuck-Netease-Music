@@ -244,17 +244,43 @@ function configureSession() {
       "https://*.netease.com/*"
     ]
   };
+  const canonicalOrigin = "https://music.163.com";
+  const canonicalReferer = "https://music.163.com/";
+
+  const readHeader = (headers, key) => headers[key] || headers[key.toLowerCase()];
+  const setHeaderPair = (headers, key, value) => {
+    headers[key] = value;
+    headers[key.toLowerCase()] = value;
+  };
+  const isOrpheusHeader = (value) =>
+    typeof value === "string" && value.startsWith(`${ORPHEUS_SCHEME}://`);
+  const needsCanonicalSiteHeaders = (details, headers) => {
+    const originHeader = readHeader(headers, "Origin");
+    const refererHeader = readHeader(headers, "Referer");
+    if (isOrpheusHeader(originHeader) || isOrpheusHeader(refererHeader)) {
+      return true;
+    }
+
+    const requestUrl = String(details.url || "");
+    if (!/^https:\/\/[^/]+\.(music\.126\.net|126\.net)(\/|$)/i.test(requestUrl)) {
+      return false;
+    }
+
+    const destination =
+      details.resourceType ||
+      readHeader(headers, "Sec-Fetch-Dest") ||
+      readHeader(headers, "sec-fetch-dest") ||
+      "";
+    return ["image", "media", "audio"].includes(String(destination).toLowerCase());
+  };
 
   defaultSession.webRequest.onBeforeSendHeaders(corsFilter, (details, callback) => {
     const headers = {
       ...details.requestHeaders
     };
-    const originHeader = headers.Origin || headers.origin;
-    if (typeof originHeader === "string" && originHeader.startsWith("orpheus://")) {
-      headers.Origin = "https://music.163.com";
-      headers.origin = "https://music.163.com";
-      headers.Referer = headers.Referer || "https://music.163.com/";
-      headers.referer = headers.referer || "https://music.163.com/";
+    if (needsCanonicalSiteHeaders(details, headers)) {
+      setHeaderPair(headers, "Origin", canonicalOrigin);
+      setHeaderPair(headers, "Referer", canonicalReferer);
     }
     callback({ requestHeaders: headers });
   });
