@@ -291,8 +291,10 @@ jobs:
       - name: Setup AUR SSH
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          umask 077
+          printf '%b' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
+          ssh-keygen -y -f ~/.ssh/aur > /dev/null
           cat <<'EOF' > ~/.ssh/config
           Host aur.archlinux.org
             IdentityFile ~/.ssh/aur
