@@ -1,0 +1,319 @@
+name: Build Linux Packages
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  APP_DIR: linux-port
+  AUR_PKGBASE: fuck-netease-music-git
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: linux-port/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: Run syntax checks
+        working-directory: ${{ env.APP_DIR }}
+        run: npm run check
+
+  build-appimage:
+    name: AppImage (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runs_on: ubuntu-latest
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: linux-port/package-lock.json
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2 rpm
+
+      - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+
+      - name: Build AppImage
+        working-directory: ${{ env.APP_DIR }}
+        run: npx electron-builder --linux AppImage --publish never --${{ matrix.arch }}
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: linux-port/dist/*.AppImage
+          if-no-files-found: error
+
+  build-arch-package:
+    name: Arch Linux Package
+    needs: build-appimage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download x64 AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-x64
+          path: dist-input
+
+      - name: Prepare PKGBUILD
+        run: |
+          APP_VERSION="$(node -p "require('./linux-port/package.json').version")"
+          cp dist-input/*.AppImage packaging/arch/fuck-netease-music.AppImage
+          sed "s/__APP_VERSION__/${APP_VERSION}/g" packaging/arch/PKGBUILD.in > packaging/arch/PKGBUILD
+
+      - name: Build package in Arch container
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace \
+            archlinux:base-devel \
+            bash -lc '
+              pacman -Syu --noconfirm --needed base-devel git zstd
+              useradd -m builder
+              chown -R builder:builder /workspace
+              su builder -c "
+                cd /workspace/packaging/arch &&
+                makepkg -f --nodeps --noconfirm &&
+                makepkg --printsrcinfo > .SRCINFO
+              "
+            '
+
+      - name: Upload Arch package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archlinux-package
+          path: |
+            packaging/arch/*.pkg.tar.zst
+            packaging/arch/PKGBUILD
+            packaging/arch/.SRCINFO
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs:
+      - build-appimage
+      - build-arch-package
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download x64 AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-x64
+          path: release-assets/appimage-x64
+
+      - name: Download arm64 AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-arm64
+          path: release-assets/appimage-arm64
+
+      - name: Download Arch package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: archlinux-package
+          path: release-assets/archlinux
+
+      - name: Normalize release asset names
+        run: |
+          mkdir -p release-assets/upload
+          cp release-assets/appimage-x64/*.AppImage release-assets/upload/fuck-netease-music-x64.AppImage
+          cp release-assets/appimage-arm64/*.AppImage release-assets/upload/fuck-netease-music-arm64.AppImage
+
+      - name: Compute release metadata
+        id: meta
+        run: |
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+          SAFE_BRANCH="$(printf '%s' "${BRANCH_NAME}" | tr '/_' '-' | tr -cd '[:alnum:]-.' )"
+          RELEASE_TAG="rolling-${SAFE_BRANCH}"
+          RELEASE_NAME="Rolling Release (${BRANCH_NAME})"
+          PREV_REF=""
+          if git rev-parse "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            PREV_REF="refs/tags/${RELEASE_TAG}"
+          fi
+
+          {
+            echo "release_tag=${RELEASE_TAG}"
+            echo "release_name=${RELEASE_NAME}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "notes<<EOF"
+            echo "Branch: ${BRANCH_NAME}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo
+            echo "Changes since previous release:"
+            if [ -n "${PREV_REF}" ]; then
+              git log --pretty='- %s (%h)' "${PREV_REF}..${GITHUB_SHA}"
+            else
+              git log --pretty='- %s (%h)' --max-count=50 "${GITHUB_SHA}"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Move rolling tag to current commit
+        run: |
+          TAG_NAME="${{ steps.meta.outputs.release_tag }}"
+          git tag -f "${TAG_NAME}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${TAG_NAME}" --force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_name }}
+          body: ${{ steps.meta.outputs.notes }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: false
+          append_body: false
+          make_latest: false
+          prerelease: true
+          draft: false
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            release-assets/upload/fuck-netease-music-x64.AppImage
+            release-assets/upload/fuck-netease-music-arm64.AppImage
+            release-assets/archlinux/*.pkg.tar.zst
+            release-assets/archlinux/PKGBUILD
+            release-assets/archlinux/.SRCINFO
+
+  publish-aur:
+    name: Publish to AUR
+    needs:
+      - release
+    if: github.event_name == 'push' && github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download x64 AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-x64
+          path: aur-input
+
+      - name: Prepare AUR metadata
+        id: aurmeta
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./linux-port/package.json').version")"
+          COMMIT_COUNT="$(git rev-list --count HEAD)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          PKGVER="${PACKAGE_VERSION}.r${COMMIT_COUNT}.g${SHORT_SHA}"
+          APPIMAGE_FILE="fuck-netease-music-x64.AppImage"
+          cp aur-input/*.AppImage "${APPIMAGE_FILE}"
+          APPIMAGE_SHA256="$(sha256sum "${APPIMAGE_FILE}" | awk '{print $1}')"
+          APPIMAGE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/rolling-main/${APPIMAGE_FILE}"
+
+          sed \
+            -e "s/__PKGVER__/${PKGVER}/g" \
+            -e "s|__APPIMAGE_URL__|${APPIMAGE_URL}|g" \
+            -e "s/__APPIMAGE_SHA256__/${APPIMAGE_SHA256}/g" \
+            packaging/aur/PKGBUILD.in > packaging/aur/PKGBUILD
+
+          {
+            echo "pkgver=${PKGVER}"
+            echo "appimage_sha256=${APPIMAGE_SHA256}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Generate .SRCINFO
+        run: |
+          docker run --rm \
+            -v "${PWD}:/workspace" \
+            -w /workspace/packaging/aur \
+            archlinux:base-devel \
+            bash -lc '
+              pacman -Syu --noconfirm --needed base-devel
+              useradd -m builder
+              chown -R builder:builder /workspace
+              su builder -c "cd /workspace/packaging/aur && makepkg --printsrcinfo > .SRCINFO"
+            '
+
+      - name: Setup AUR SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat <<'EOF' > ~/.ssh/config
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+          EOF
+
+      - name: Clone AUR repo
+        run: |
+          git clone "ssh://aur@aur.archlinux.org/${AUR_PKGBASE}.git" aur-repo
+
+      - name: Update AUR files
+        run: |
+          cp packaging/aur/PKGBUILD aur-repo/PKGBUILD
+          cp packaging/aur/.SRCINFO aur-repo/.SRCINFO
+          cp packaging/aur/fuck-netease-music.sh aur-repo/fuck-netease-music.sh
+          cp packaging/aur/fuck-netease-music.desktop aur-repo/fuck-netease-music.desktop
+
+      - name: Commit and push to AUR
+        run: |
+          cd aur-repo
+          git config user.name "fucknetease"
+          git config user.email "sh1tnetease@outlook.com"
+          git add PKGBUILD .SRCINFO fuck-netease-music.sh fuck-netease-music.desktop
+          git diff --cached --quiet && exit 0
+          git commit -m "update to ${{ steps.aurmeta.outputs.pkgver }}"
+          git push
