@@ -2285,6 +2285,131 @@ function installReactDomProbe() {
   });
 }
 
+function installClipboardBridge() {
+  const readSelectionText = () => {
+    const activeElement = document.activeElement;
+    if (
+      activeElement &&
+      typeof activeElement.value === "string" &&
+      Number.isInteger(activeElement.selectionStart) &&
+      Number.isInteger(activeElement.selectionEnd)
+    ) {
+      const start = Math.min(activeElement.selectionStart, activeElement.selectionEnd);
+      const end = Math.max(activeElement.selectionStart, activeElement.selectionEnd);
+      if (end > start) {
+        return activeElement.value.slice(start, end);
+      }
+    }
+
+    const selection = window.getSelection?.();
+    return selection ? String(selection) : "";
+  };
+
+  const writeClipboardText = async (text = "") => {
+    const normalizedText = String(text ?? "");
+    try {
+      const result = await invokeNative("os.setclipboardtext", [normalizedText]);
+      if (result && typeof result === "object" && "success" in result) {
+        return Boolean(result.success);
+      }
+      return Boolean(result);
+    } catch (error) {
+      console.error("[clipboard.write]", error);
+      return false;
+    }
+  };
+
+  const readClipboardText = async () => {
+    try {
+      const result = await invokeNative("os.getclipboardtext", []);
+      return typeof result === "string" ? result : String(result ?? "");
+    } catch (error) {
+      console.error("[clipboard.read]", error);
+      return "";
+    }
+  };
+
+  const patchNavigatorClipboard = () => {
+    const descriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
+    if (descriptor && !descriptor.configurable) {
+      return;
+    }
+
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      enumerable: true,
+      value: {
+        writeText: async (text) => {
+          const ok = await writeClipboardText(text);
+          if (!ok) {
+            throw new Error("clipboard-write-failed");
+          }
+        },
+        readText: readClipboardText
+      }
+    });
+  };
+
+  const patchExecCommand = () => {
+    const originalExecCommand =
+      typeof document.execCommand === "function" ? document.execCommand.bind(document) : null;
+
+    document.execCommand = function patchedExecCommand(command, ...args) {
+      if (String(command || "").toLowerCase() !== "copy") {
+        if (originalExecCommand) {
+          return originalExecCommand(command, ...args);
+        }
+        return false;
+      }
+
+      const clipboardStore = new Map();
+      const event = new Event("copy", {
+        bubbles: true,
+        cancelable: true
+      });
+      Object.defineProperty(event, "clipboardData", {
+        configurable: true,
+        enumerable: true,
+        value: {
+          setData(type, value) {
+            clipboardStore.set(String(type || "").toLowerCase(), String(value ?? ""));
+          },
+          getData(type) {
+            return clipboardStore.get(String(type || "").toLowerCase()) || "";
+          },
+          clearData(type) {
+            if (typeof type === "undefined") {
+              clipboardStore.clear();
+              return;
+            }
+            clipboardStore.delete(String(type || "").toLowerCase());
+          }
+        }
+      });
+
+      const target =
+        document.activeElement instanceof EventTarget
+          ? document.activeElement
+          : document.body || document;
+      target.dispatchEvent(event);
+
+      const nextText =
+        clipboardStore.get("text/plain") ||
+        clipboardStore.get("text") ||
+        readSelectionText();
+      if (!nextText) {
+        return false;
+      }
+
+      void writeClipboardText(nextText);
+      return true;
+    };
+  };
+
+  patchNavigatorClipboard();
+  patchExecCommand();
+}
+
 const localAudioBridge = createLocalAudioBridge();
 const localPopupMenuBridge = createLocalPopupMenuBridge();
 
@@ -2549,6 +2674,7 @@ installFetchBridge();
 installWebpackChunkPatch();
 installRendererCompatibilityBootstrap();
 installReactDomProbe();
+installClipboardBridge();
 
 window.addEventListener("error", (event) => {
   reportRendererError("error", {

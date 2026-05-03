@@ -1760,6 +1760,27 @@ function createNativeApi(options) {
     return normalizeStorageTarget(targetPath);
   }
 
+  function writeClipboardText(text = "") {
+    const normalizedText = String(text || "");
+    clipboard.writeText(normalizedText, "clipboard");
+    try {
+      clipboard.writeText(normalizedText, "selection");
+    } catch {}
+    return normalizedText;
+  }
+
+  function readClipboardText() {
+    const clipboardText = clipboard.readText("clipboard");
+    if (clipboardText) {
+      return clipboardText;
+    }
+    try {
+      return clipboard.readText("selection");
+    } catch {
+      return "";
+    }
+  }
+
   async function readTextFile(targetPath) {
     if (!(await pathExists(targetPath))) {
       return "";
@@ -3432,10 +3453,20 @@ function createNativeApi(options) {
     }),
     "os.navigateexternal": async (target) => shell.openExternal(String(target || "")),
     "os.setclipboardtext": async (text = "") => {
-      clipboard.writeText(String(text || ""));
+      const normalizedText = writeClipboardText(text);
+      return {
+        success: true,
+        text: normalizedText,
+        clipboard: clipboard.readText("clipboard"),
+        selection: readClipboardText()
+      };
+    },
+    "winhelper.setclipboarddata": async (text = "") => {
+      writeClipboardText(text);
       return true;
     },
-    "os.getclipboardtext": async () => clipboard.readText(),
+    "os.getclipboardtext": async () => readClipboardText(),
+    "winhelper.getclipboarddata": async () => readClipboardText(),
     "os.querysystemfonts": async () => [],
     "os.checknativesupportfonts": async () => [],
     "os.exitwindowsystemlefttime": async () => 0,
