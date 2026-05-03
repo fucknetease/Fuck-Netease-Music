@@ -350,7 +350,12 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           umask 077
-          printf '%s' "${{ secrets.FUCK_NETEASE_AUR }}" | tr -d '\r' > ~/.ssh/aur
+          SECRET_VALUE='${{ secrets.FUCK_NETEASE_AUR }}'
+          if printf '%s' "${SECRET_VALUE}" | grep -q "BEGIN .* PRIVATE KEY"; then
+            printf '%s' "${SECRET_VALUE}" | tr -d '\r' > ~/.ssh/aur
+          else
+            printf '%s' "${SECRET_VALUE}" | tr -d '\r\n' | base64 -d > ~/.ssh/aur
+          fi
           chmod 600 ~/.ssh/aur
           ssh-keygen -y -f ~/.ssh/aur > /dev/null
           cat <<'EOF' > ~/.ssh/config
