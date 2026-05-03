@@ -406,6 +406,150 @@ function safeParseJson(value, fallbackValue) {
   }
 }
 
+function captureAppContext(app) {
+  if (!app || (typeof app !== "object" && typeof app !== "function")) {
+    return;
+  }
+
+  window.__NETEASE_APP_CONTEXT__ = { app };
+  if (window.__NETEASE_LINUX_PORT__) {
+    window.__NETEASE_LINUX_PORT__.app = app;
+  }
+
+  const store = readStoreFromCandidate(app);
+  if (store) {
+    window.__NETEASE_APP_STORE__ = store;
+    if (window.__NETEASE_LINUX_PORT__) {
+      window.__NETEASE_LINUX_PORT__.appStore = store;
+    }
+    if (!window.__NETEASE_LINUX_STORE_CAPTURED__) {
+      window.__NETEASE_LINUX_STORE_CAPTURED__ = true;
+      reportRendererInfo("bootstrap-store-captured", {
+        storeKeys: Object.keys(store.getState?.() || {}).slice(0, 50)
+      });
+    }
+  }
+}
+
+function patchAppContextModule(moduleTable) {
+  if (!moduleTable || typeof moduleTable !== "object") {
+    return;
+  }
+
+  for (const [moduleId, moduleFactory] of Object.entries(moduleTable)) {
+    if (typeof moduleFactory !== "function" || moduleFactory.__LINUX_APP_CONTEXT_PATCHED__) {
+      continue;
+    }
+
+    const source = Function.prototype.toString.call(moduleFactory);
+    if (!source.includes('setAppContext') || !source.includes('getAppContext')) {
+      continue;
+    }
+
+    const patchedFactory = function patchedAppContextModule(e, o, t) {
+      moduleFactory(e, o, t);
+
+      const exportCandidates = [o, o?.default, o?.a];
+      for (const exportsObject of exportCandidates) {
+        if (!exportsObject || typeof exportsObject !== "object") {
+          continue;
+        }
+
+        const originalSetAppContext = exportsObject.setAppContext;
+        if (
+          typeof originalSetAppContext !== "function" ||
+          originalSetAppContext.__LINUX_APP_CONTEXT_PATCHED__
+        ) {
+          continue;
+        }
+
+        exportsObject.setAppContext = function patchedSetAppContext(app, ...args) {
+          captureAppContext(app);
+          return originalSetAppContext.call(this, app, ...args);
+        };
+        exportsObject.setAppContext.__LINUX_APP_CONTEXT_PATCHED__ = true;
+
+        const originalGetAppContext = exportsObject.getAppContext;
+        if (typeof originalGetAppContext === "function" && !originalGetAppContext.__LINUX_APP_CONTEXT_PATCHED__) {
+          exportsObject.getAppContext = function patchedGetAppContext(...args) {
+            const appContext = originalGetAppContext.apply(this, args);
+            try {
+              if (typeof appContext?._currentValue?.app !== "undefined") {
+                captureAppContext(appContext._currentValue.app);
+              }
+            } catch {}
+            return appContext;
+          };
+          exportsObject.getAppContext.__LINUX_APP_CONTEXT_PATCHED__ = true;
+        }
+
+        patchedFactory.__LINUX_APP_CONTEXT_PATCHED__ = true;
+        console.log("[linux:patch] app context module patched", moduleId);
+        return;
+      }
+    };
+
+    patchedFactory.__LINUX_APP_CONTEXT_PATCHED__ = true;
+    patchedFactory.__LINUX_APP_CONTEXT_PATCHED_FROM__ = moduleFactory;
+    moduleTable[moduleId] = patchedFactory;
+  }
+}
+
+function patchDvaToolModule(moduleTable) {
+  if (!moduleTable || typeof moduleTable !== "object") {
+    return;
+  }
+
+  for (const [moduleId, moduleFactory] of Object.entries(moduleTable)) {
+    if (typeof moduleFactory !== "function" || moduleFactory.__LINUX_DVA_TOOL_PATCHED__) {
+      continue;
+    }
+
+    const source = Function.prototype.toString.call(moduleFactory);
+    if (
+      !source.includes("can't get store before inited") ||
+      !source.includes("getDispatch") ||
+      !source.includes("this.app=e")
+    ) {
+      continue;
+    }
+
+    const patchedFactory = function patchedDvaToolModule(e, o, t) {
+      moduleFactory(e, o, t);
+
+      const exportCandidates = [o, o?.default, o?.a];
+      for (const exportsObject of exportCandidates) {
+        const singleton = exportsObject?.a || exportsObject;
+        if (!singleton || typeof singleton !== "object") {
+          continue;
+        }
+
+        const originalInit = singleton.init;
+        if (typeof originalInit !== "function" || originalInit.__LINUX_DVA_TOOL_PATCHED__) {
+          continue;
+        }
+
+        singleton.init = function patchedDvaToolInit(app, history, ...args) {
+          captureAppContext(app);
+          if (history && window.__NETEASE_LINUX_PORT__) {
+            window.__NETEASE_LINUX_PORT__.history = history;
+          }
+          return originalInit.call(this, app, history, ...args);
+        };
+        singleton.init.__LINUX_DVA_TOOL_PATCHED__ = true;
+
+        patchedFactory.__LINUX_DVA_TOOL_PATCHED__ = true;
+        console.log("[linux:patch] dva tool module patched", moduleId);
+        return;
+      }
+    };
+
+    patchedFactory.__LINUX_DVA_TOOL_PATCHED__ = true;
+    patchedFactory.__LINUX_DVA_TOOL_PATCHED_FROM__ = moduleFactory;
+    moduleTable[moduleId] = patchedFactory;
+  }
+}
+
 function patchDownloadObservableModule(moduleTable) {
   if (!moduleTable || typeof moduleTable !== "object") {
     return;
@@ -450,6 +594,8 @@ function patchWebpackChunkEntry(chunkEntry) {
     return;
   }
 
+  patchAppContextModule(chunkEntry[1]);
+  patchDvaToolModule(chunkEntry[1]);
   patchDownloadObservableModule(chunkEntry[1]);
 }
 
@@ -1397,6 +1543,18 @@ function resolveAppStoreFromWebpackCache(req) {
 function resolveAppStoreFromWindowGlobals() {
   const globalCandidates = [];
 
+  if (window.__NETEASE_APP_STORE__) {
+    globalCandidates.push(window.__NETEASE_APP_STORE__);
+  }
+  if (window.__NETEASE_APP_CONTEXT__) {
+    globalCandidates.push(window.__NETEASE_APP_CONTEXT__);
+  }
+  if (window.__NETEASE_LINUX_PORT__?.appStore) {
+    globalCandidates.push(window.__NETEASE_LINUX_PORT__.appStore);
+  }
+  if (window.__NETEASE_LINUX_PORT__?.app) {
+    globalCandidates.push(window.__NETEASE_LINUX_PORT__.app);
+  }
   if (window.g_app) {
     globalCandidates.push(window.g_app);
   }
