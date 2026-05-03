@@ -7,6 +7,30 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { screen, shell, nativeTheme, dialog, session, globalShortcut, Menu, clipboard } = require("electron");
+const { createDownloadManager } = require("./native-api/download-manager");
+const { createNetworkHandlers } = require("./native-api/network");
+const { createSessionRuntime } = require("./native-api/session");
+const { createStorageHandlers } = require("./native-api/storage");
+const { createWindowHandlers } = require("./native-api/window-handlers");
+const {
+  normalizeAssetUrl,
+  normalizeDataValue,
+  normalizeJsonText,
+  sanitizeHomePageEcpmCacheText
+} = require("./shared/data-normalization");
+const { maybeRepairUtf8Mojibake } = require("./shared/text-normalization");
+const {
+  buildCompatibilityFallbackRequest,
+  buildPublicApiFallbackRequest,
+  createEmptyRpcResponse,
+  decodeRpcBody,
+  isAuthOrVipApiPath,
+  isJsonLikeRpcResponse,
+  isSuccessfulRpcResponse,
+  rewriteRpcUrl,
+  safeJsonParse,
+  shouldForcePublicApiFallback
+} = require("./native-api/rpc");
 
 function hashString(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
@@ -40,285 +64,6 @@ function isSubPath(baseDir, candidatePath) {
 
 function toForwardSlash(value) {
   return value.split(path.sep).join("/");
-}
-
-function safeJsonParse(contents, fallbackValue) {
-  try {
-    return JSON.parse(contents);
-  } catch {
-    return fallbackValue;
-  }
-}
-
-function countMatches(value, pattern) {
-  const matches = value.match(pattern);
-  return matches ? matches.length : 0;
-}
-
-function scoreReadableEastAsianText(value) {
-  if (typeof value !== "string" || !value) {
-    return 0;
-  }
-  return (
-    countMatches(value, /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) * 3 +
-    countMatches(value, /[\u3040-\u30ff]/g) * 2 +
-    countMatches(value, /[\uac00-\ud7af]/g) * 2
-  );
-}
-
-function scoreUtf8MojibakeMarkers(value) {
-  if (typeof value !== "string" || !value) {
-    return 0;
-  }
-  return (
-    countMatches(value, /[ÃÂÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]/g) +
-    countMatches(value, /[\u0080-\u009f]/g) * 2
-  );
-}
-
-function maybeRepairUtf8Mojibake(value) {
-  if (typeof value !== "string" || !value) {
-    return value;
-  }
-
-  const markerScore = scoreUtf8MojibakeMarkers(value);
-  if (markerScore === 0) {
-    return value;
-  }
-
-  let repaired;
-  try {
-    repaired = Buffer.from(value, "latin1").toString("utf8");
-  } catch {
-    return value;
-  }
-
-  if (!repaired || repaired === value || repaired.includes("\uFFFD")) {
-    return value;
-  }
-
-  const originalReadableScore = scoreReadableEastAsianText(value);
-  const repairedReadableScore = scoreReadableEastAsianText(repaired);
-  const repairedMarkerScore = scoreUtf8MojibakeMarkers(repaired);
-
-  if (repairedReadableScore <= originalReadableScore) {
-    return value;
-  }
-
-  if (repairedMarkerScore > markerScore) {
-    return value;
-  }
-
-  return repaired;
-}
-
-function normalizeDataValue(value) {
-  if (typeof value === "string") {
-    return normalizeAssetUrl(normalizeJsonText(maybeRepairUtf8Mojibake(value)));
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => normalizeDataValue(item));
-  }
-  if (value && typeof value === "object") {
-    const normalizedEcpmPayload = normalizeHomePageEcpmPayload(value);
-    if (normalizedEcpmPayload !== value) {
-      return normalizeDataValue(normalizedEcpmPayload);
-    }
-    const output = {};
-    for (const [key, entry] of Object.entries(value)) {
-      output[key] = normalizeDataValue(entry);
-    }
-    return output;
-  }
-  return value;
-}
-
-function normalizeAssetUrl(value) {
-  if (typeof value !== "string" || !value) {
-    return value;
-  }
-
-  if (/^\/\//.test(value)) {
-    return `https:${value}`;
-  }
-
-  if (/^http:\/\/[^/\s]+\.(music\.126\.net|music\.163\.com|126\.net|netease\.com)(\/|$)/i.test(value)) {
-    return value.replace(/^http:\/\//i, "https://");
-  }
-
-  return value;
-}
-
-function normalizeEcpmBlockEntry(blockName, blockValue) {
-  const fallbackTitles = {
-    featureRecommendBlock: "每日推荐",
-    recommendPlaylistBlock: "推荐歌单",
-    bannersBlock: "精选活动",
-    ranklistBlock: "排行榜",
-    allListenBlock: "大家都在听",
-    recentListenBlock: "最近在听",
-    heartbeatRecommendBlock: "红心推荐",
-    radarBlock: "私人雷达",
-    vipRecommendBlock: "会员推荐",
-    styleRecommendBlock: "风格推荐",
-    dailyVoiceBlock: "每日播客",
-    personalizeVoiceListBlock: "热门播客",
-    listenAudioBookBlock: "听见好书"
-  };
-
-  const normalizedBlock =
-    blockValue && typeof blockValue === "object" && !Array.isArray(blockValue)
-      ? { ...blockValue }
-      : {};
-
-  if (blockName === "bannersBlock") {
-    return {
-      ...normalizedBlock,
-      title: "",
-      data: [],
-      alg: ""
-    };
-  }
-
-  if (typeof normalizedBlock.title !== "string" || !normalizedBlock.title) {
-    const nestedTitle =
-      normalizedBlock.data &&
-      typeof normalizedBlock.data === "object" &&
-      !Array.isArray(normalizedBlock.data)
-        ? normalizedBlock.data.blockName ||
-          normalizedBlock.data.title ||
-          normalizedBlock.data.uiElement?.mainTitle?.title ||
-          ""
-        : "";
-    normalizedBlock.title = nestedTitle || fallbackTitles[blockName] || "";
-  }
-
-  if (typeof normalizedBlock.alg !== "string") {
-    normalizedBlock.alg = normalizedBlock.alg ? String(normalizedBlock.alg) : "";
-  }
-
-  if (
-    blockName === "listenAudioBookBlock" &&
-    normalizedBlock.data &&
-    typeof normalizedBlock.data === "object" &&
-    !Array.isArray(normalizedBlock.data) &&
-    Array.isArray(normalizedBlock.data.creatives)
-  ) {
-    normalizedBlock.data = normalizedBlock.data.creatives;
-  }
-
-  if (typeof normalizedBlock.data === "undefined" || normalizedBlock.data === null) {
-    normalizedBlock.data = [];
-  }
-
-  return normalizedBlock;
-}
-
-function normalizeHomePageEcpmPayload(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return value;
-  }
-
-  const blockKeys = [
-    "featureRecommendBlock",
-    "recommendPlaylistBlock",
-    "bannersBlock",
-    "ranklistBlock",
-    "allListenBlock",
-    "recentListenBlock",
-    "heartbeatRecommendBlock",
-    "radarBlock",
-    "vipRecommendBlock",
-    "styleRecommendBlock",
-    "dailyVoiceBlock",
-    "personalizeVoiceListBlock",
-    "listenAudioBookBlock"
-  ];
-
-  if (!blockKeys.some((key) => key in value)) {
-    return value;
-  }
-
-  const normalized = { ...value };
-  for (const key of blockKeys) {
-    normalized[key] = normalizeEcpmBlockEntry(key, normalized[key]);
-  }
-  if (Array.isArray(normalized.homePageEcpmOrderedBlocks)) {
-    normalized.homePageEcpmOrderedBlocks = normalized.homePageEcpmOrderedBlocks.filter(
-      (blockName) => blockName !== "bannersBlock"
-    );
-  }
-  if (Array.isArray(normalized.orderedBlocks)) {
-    normalized.orderedBlocks = normalized.orderedBlocks.filter(
-      (blockName) => blockName !== "bannersBlock"
-    );
-  }
-  return normalized;
-}
-
-function sanitizeHomePageEcpmCachePayload(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return value;
-  }
-
-  const nextValue = { ...value };
-  if (nextValue.homePageEcpmResourceDatas) {
-    nextValue.homePageEcpmResourceDatas = normalizeHomePageEcpmPayload(
-      nextValue.homePageEcpmResourceDatas
-    );
-  }
-  if (Array.isArray(nextValue.homePageEcpmOrderedBlocks)) {
-    nextValue.homePageEcpmOrderedBlocks = nextValue.homePageEcpmOrderedBlocks.filter(
-      (blockName) => blockName !== "bannersBlock"
-    );
-  }
-  return nextValue;
-}
-
-function sanitizeHomePageEcpmCacheText(text) {
-  if (typeof text !== "string" || !text.trim()) {
-    return text;
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return text;
-  }
-
-  const sanitized = sanitizeHomePageEcpmCachePayload(parsed);
-  return sanitized === parsed ? text : JSON.stringify(sanitized);
-}
-
-function deepEqualJsonLike(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function normalizeJsonText(text) {
-  if (typeof text !== "string" || !text) {
-    return text;
-  }
-
-  const trimmed = text.trim();
-  if (
-    !trimmed ||
-    ((!trimmed.startsWith("{") || !trimmed.endsWith("}")) &&
-      (!trimmed.startsWith("[") || !trimmed.endsWith("]")))
-  ) {
-    return text;
-  }
-
-  try {
-    const parsed = JSON.parse(text);
-    const normalized = normalizeDataValue(parsed);
-    if (deepEqualJsonLike(parsed, normalized)) {
-      return text;
-    }
-    return JSON.stringify(normalized);
-  } catch {
-    return text;
-  }
 }
 
 function normalizeSqlStringLiteralToken(token) {
@@ -514,147 +259,6 @@ function guessFileExtensionFromUrl(inputUrl, fallbackExtension = ".bin") {
   }
 }
 
-function rewriteRpcUrl(url) {
-  const rewrites = [
-    ["/eapi/comment/pc/song/mode/initial/carousel", "/api/comment/pc/song/mode/initial/carousel"],
-    ["/eapi/resource-exposure/config", "/api/resource-exposure/config"],
-    ["/eapi/link/position/show/resource", "/api/link/position/show/resource"],
-    ["/eapi/pc/upgrade/get", "/api/pc/upgrade/get"],
-    ["/eapi/pl/count", "/api/pl/count"]
-  ];
-
-  for (const [source, target] of rewrites) {
-    if (url.includes(source)) {
-      return url.replace(source, target);
-    }
-  }
-
-  return url;
-}
-
-function decodeRpcBody(body) {
-  if (typeof body !== "string" || !body.startsWith("params=")) {
-    return null;
-  }
-
-  try {
-    const decoded = decodeURIComponent(body.slice("params=".length));
-    const parsed = JSON.parse(decoded);
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      return null;
-    }
-    const rawPayload = parsed[1];
-    const payloadObject = typeof rawPayload === "string"
-      ? safeJsonParse(rawPayload, null)
-      : rawPayload && typeof rawPayload === "object"
-        ? rawPayload
-        : null;
-    return {
-      apiPath: typeof parsed[0] === "string" ? parsed[0] : "",
-      payload: rawPayload,
-      payloadObject
-    };
-  } catch {
-    return null;
-  }
-}
-
-function buildPublicApiFallbackRequest(url, rpcBody) {
-  if (!url.includes("interfacepc.music.163.com")) {
-    return null;
-  }
-
-  const apiPath = rpcBody && typeof rpcBody.apiPath === "string" ? rpcBody.apiPath : "";
-  if (!apiPath.startsWith("/api/")) {
-    return null;
-  }
-
-  const payloadObject = rpcBody && rpcBody.payloadObject && typeof rpcBody.payloadObject === "object"
-    ? { ...rpcBody.payloadObject }
-    : {};
-  delete payloadObject.header;
-  delete payloadObject.e_r;
-
-  const requestBody = new URLSearchParams();
-  for (const [key, value] of Object.entries(payloadObject)) {
-    if (typeof value === "undefined" || value === null) {
-      continue;
-    }
-    requestBody.set(key, typeof value === "string" ? value : String(value));
-  }
-
-  return {
-    url: `https://music.163.com${apiPath}`,
-    body: requestBody.toString()
-  };
-}
-
-function buildCompatibilityFallbackRequest(apiPath, payloadObject = {}) {
-  if (apiPath === "/api/playlist/v4/detail") {
-    const requestBody = new URLSearchParams();
-    for (const key of ["id", "n", "s"]) {
-      const value = payloadObject[key];
-      if (typeof value === "undefined" || value === null) {
-        continue;
-      }
-      requestBody.set(key, typeof value === "string" ? value : String(value));
-    }
-    return {
-      url: "https://music.163.com/api/v6/playlist/detail",
-      body: requestBody.toString()
-    };
-  }
-
-  return null;
-}
-
-function getRpcResponseCode(text) {
-  if (!text || typeof text !== "string") {
-    return null;
-  }
-  const parsed = safeJsonParse(text, null);
-  if (!parsed || typeof parsed !== "object") {
-    return null;
-  }
-  return typeof parsed.code === "number" ? parsed.code : null;
-}
-
-function isSuccessfulRpcResponse(text) {
-  const code = getRpcResponseCode(text);
-  return code === null || code === 200;
-}
-
-function isJsonLikeRpcResponse(text) {
-  if (!text || typeof text !== "string" || !text.trim()) {
-    return false;
-  }
-  const parsed = safeJsonParse(text, null);
-  return Boolean(parsed) && (Array.isArray(parsed) || typeof parsed === "object");
-}
-
-function isAuthOrVipApiPath(apiPath = "") {
-  return [
-    "/api/login/",
-    "/api/sms/",
-    "/api/register/anonimous",
-    "/api/cellphone/existence/check",
-    "/api/user/bindingCellphone",
-    "/api/w/login",
-    "/api/w/register/cellphone",
-    "/api/w/nuser/account/get",
-    "/api/w/v1/user/detail/",
-    "/api/music-vip-membership/client/vip/info"
-  ].some((prefix) => apiPath.startsWith(prefix));
-}
-
-function shouldForcePublicApiFallback(apiPath, text) {
-  if (!isAuthOrVipApiPath(apiPath)) {
-    return false;
-  }
-  const code = getRpcResponseCode(text);
-  return code !== null && code >= 500;
-}
-
 function splitSetCookieHeader(headerValue) {
   if (!headerValue || typeof headerValue !== "string") {
     return [];
@@ -753,93 +357,6 @@ function parseSetCookieString(setCookieValue, responseUrl) {
   return normalizeSetCookiePayload(cookie);
 }
 
-function createEmptyRpcResponse(apiPath = "", url = "") {
-  const response = {
-    code: 200,
-    message: "",
-    data: {}
-  };
-
-  const pathHint = `${apiPath} ${url}`;
-
-  if (/banner\/get/.test(pathHint)) {
-    response.banners = [];
-  }
-
-  if (
-    /personalized\/newsong/.test(pathHint) ||
-    /discovery\/new\/songs/.test(pathHint)
-  ) {
-    response.result = [];
-  }
-
-  if (
-    /personal\/page\/playlist\/rcmd/.test(pathHint) ||
-    /playlist\/tag\/rcmd/.test(pathHint) ||
-    /playlist\/list\/get/.test(pathHint)
-  ) {
-    response.playlists = [];
-  }
-
-  if (
-    /voicelist\/rcmd\/list/.test(pathHint) ||
-    /program\/recommend\/v2/.test(pathHint) ||
-    /voice\/homepage\/block\/content/.test(pathHint)
-  ) {
-    response.data = {
-      ...response.data,
-      recommendVoiceVOS: []
-    };
-  }
-
-  if (/search\/default\/keyword\/get/.test(pathHint)) {
-    response.data = {
-      ...response.data,
-      showKeyword: "",
-      realkeyword: ""
-    };
-  }
-
-  if (/resource-exposure\/config/.test(pathHint)) {
-    response.data = {
-      ...response.data,
-      resources: []
-    };
-  }
-
-  if (/link\/position\/show\/resource/.test(pathHint)) {
-    response.data = {
-      ...response.data,
-      resources: [],
-      hasMore: false
-    };
-  }
-
-  if (/pc\/version/.test(pathHint)) {
-    response.data = {
-      ...response.data,
-      core: null,
-      native: null,
-      orpheus: null
-    };
-  }
-
-  if (/pc\/upgrade\/get/.test(pathHint)) {
-    response.data = {
-      ...response.data,
-      version: "",
-      needUpdate: false
-    };
-  }
-
-  if (Object.keys(response.data).length === 0) {
-    response.data = {
-      recommendVoiceVOS: []
-    };
-  }
-
-  return response;
-}
 
 function escapeSqlString(value) {
   return String(value || "").replace(/'/g, "''");
@@ -912,8 +429,6 @@ function createNativeApi(options) {
   let invocationWindow = null;
   let persistedHostCache = null;
   let persistentModelTableColumnsCache = null;
-  const activeDownloads = new Map();
-  const copyNcmSubscribers = new Set();
   const playerRuntimeState = {
     info: null,
     lyrics: null,
@@ -1571,6 +1086,21 @@ function createNativeApi(options) {
     return resolved;
   }
 
+  const downloadManager = createDownloadManager({
+    app,
+    fsp,
+    path,
+    session,
+    logger,
+    pathExists,
+    ensureDir,
+    safeJsonParse,
+    normalizeAssetUrl,
+    normalizeStorageTarget,
+    isSubPath,
+    emitNativeEvent
+  });
+
   function currentWindow() {
     return invocationWindow || mainWindowRef();
   }
@@ -1816,65 +1346,6 @@ function createNativeApi(options) {
     return candidatePath;
   }
 
-  async function buildDownloadHeaders(targetUrl, extHeaderText = "") {
-    const normalizedUrl = normalizeAssetUrl(String(targetUrl || ""));
-    const headers = {
-      Origin: "https://music.163.com",
-      origin: "https://music.163.com",
-      Referer: "https://music.163.com/",
-      referer: "https://music.163.com/",
-      Accept: "*/*"
-    };
-
-    const extHeaders = safeJsonParse(String(extHeaderText || ""), {});
-    if (extHeaders && typeof extHeaders === "object" && !Array.isArray(extHeaders)) {
-      for (const [key, value] of Object.entries(extHeaders)) {
-        if (value !== undefined && value !== null && value !== "") {
-          headers[key] = String(value);
-        }
-      }
-    }
-
-    if (normalizedUrl) {
-      const cookies = await session.defaultSession.cookies.get({ url: normalizedUrl });
-      if (cookies.length > 0) {
-        headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
-      }
-    }
-
-    return headers;
-  }
-
-  function getDownloadStateSnapshot(task) {
-    const totalBytes = task.totalBytes > 0 ? task.totalBytes : Math.max(task.expectedBytes || 0, 1);
-    const downloadedBytes = Math.max(0, task.downloadedBytes || 0);
-    const progress = Math.min(1, totalBytes > 0 ? downloadedBytes / totalBytes : 0);
-    return {
-      id: task.id,
-      download: downloadedBytes,
-      total: totalBytes,
-      speed: Math.max(0, Math.round(task.speedBytesPerSecond || 0)),
-      path: task.relativePath,
-      progress
-    };
-  }
-
-  function emitDownloadProcess(task, extra = {}) {
-    const snapshot = getDownloadStateSnapshot(task);
-    const eventPayload = {
-      id: task.id,
-      type: extra.type ?? 1,
-      isLast: Boolean(extra.isLast),
-      download: snapshot.download,
-      total: snapshot.total,
-      speed: snapshot.speed,
-      path: extra.path || snapshot.path,
-      relativePath: snapshot.path
-    };
-    logger.log("[native:download:process]", JSON.stringify(eventPayload));
-    emitNativeEvent("download.onProcess", eventPayload);
-  }
-
   async function moveFileIfNeeded(sourcePath, targetPath) {
     if (!sourcePath || !targetPath || sourcePath === targetPath) {
       return targetPath || sourcePath || "";
@@ -1884,332 +1355,9 @@ function createNativeApi(options) {
     return targetPath;
   }
 
-  async function performNativeDownload(task) {
-    let response;
-    let fileHandle;
-    let fileStream;
-    try {
-      const headers = await buildDownloadHeaders(task.url, task.extHeader);
-      response = await fetch(task.url, {
-        method: "GET",
-        headers,
-        signal: task.abortController.signal
-      });
-      if (!response.ok || !response.body) {
-        throw new Error(`download failed: ${response.status}`);
-      }
-
-      const contentLength = Number(response.headers.get("content-length") || 0);
-      if (contentLength > 0) {
-        task.totalBytes = contentLength;
-      }
-
-      await ensureDir(path.dirname(task.filePath));
-      fileHandle = await fsp.open(task.filePath, "w");
-      fileStream = fileHandle.createWriteStream();
-
-      const reader = response.body.getReader();
-      let previousBytes = 0;
-      let previousTime = Date.now();
-      task.status = "downloading";
-      task.downloadedBytes = 0;
-      task.speedBytesPerSecond = 0;
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        const chunk = Buffer.from(value);
-        await new Promise((resolve, reject) => {
-          fileStream.write(chunk, (error) => (error ? reject(error) : resolve()));
-        });
-        task.downloadedBytes += chunk.length;
-        const now = Date.now();
-        const elapsed = Math.max(1, now - previousTime);
-        if (elapsed >= 500) {
-          task.speedBytesPerSecond = ((task.downloadedBytes - previousBytes) * 1000) / elapsed;
-          previousBytes = task.downloadedBytes;
-          previousTime = now;
-          emitDownloadProcess(task);
-        }
-      }
-
-      await new Promise((resolve, reject) => {
-        fileStream.end((error) => (error ? reject(error) : resolve()));
-      });
-      await fileHandle.close();
-      fileHandle = null;
-      fileStream = null;
-
-      task.speedBytesPerSecond = 0;
-      task.totalBytes = Math.max(task.totalBytes || 0, task.downloadedBytes || 0, 1);
-      task.status = "completed";
-      emitDownloadProcess(task, {
-        type: 0,
-        isLast: true,
-        path: task.relativePath
-      });
-      return { ok: true, id: task.id, path: task.relativePath };
-    } catch (error) {
-      const isAbort = error && (error.name === "AbortError" || /aborted/i.test(String(error.message || "")));
-      if (fileStream) {
-        try {
-          await new Promise((resolve) => fileStream.end(resolve));
-        } catch {
-          // ignore cleanup failure
-        }
-      }
-      if (fileHandle) {
-        try {
-          await fileHandle.close();
-        } catch {
-          // ignore cleanup failure
-        }
-      }
-
-      if (task.status === "cancelled") {
-        try {
-          await fsp.rm(task.filePath, { force: true });
-        } catch {
-          // ignore cleanup failure
-        }
-        return { ok: true, id: task.id, cancelled: true };
-      }
-      if (task.status === "paused" || isAbort) {
-        return { ok: true, id: task.id, paused: true };
-      }
-
-      logger.warn("[native:download]", task.id, error && error.message ? error.message : error);
-      emitDownloadProcess(task, {
-        type: -101,
-        isLast: true,
-        path: task.relativePath
-      });
-      return { ok: false, id: task.id, error: error && error.message ? error.message : String(error) };
-    } finally {
-      activeDownloads.delete(task.id);
-    }
-  }
-
-  async function startNativeDownload(rawPayload = {}) {
-    const payload = normalizeDownloadPayloadArgs(rawPayload);
-    const downloadDir =
-      normalizeStorageTarget(payload.downloadDir) ||
-      normalizeStorageTarget(payload.basePath) ||
-      app.getPath("downloads");
-    const relativePath = normalizeRelativeDownloadPath(
-      payload.relativePath || payload.prePath || `${payload.id || "download"}${guessFileExtensionFromUrl(payload.url)}`
-    );
-    const filePath = resolveDownloadFilePath(downloadDir, relativePath);
-    if (!payload.url || !filePath) {
-      throw new Error("invalid download payload");
-    }
-
-    logger.log(
-      "[native:download:start]",
-      JSON.stringify({
-        id: String(payload.id || ""),
-        relativePath,
-        filePath,
-        hasExtHeader: Boolean(payload.extHeader),
-        size: Number(payload.size || 0),
-        payloadKeys: Object.keys(payload).sort()
-      })
-    );
-
-    const currentTask = activeDownloads.get(String(payload.id || ""));
-    if (currentTask) {
-      currentTask.abortController.abort();
-      activeDownloads.delete(currentTask.id);
-    }
-
-    const task = {
-      id: String(payload.id || `download-${Date.now()}`),
-      url: normalizeAssetUrl(String(payload.url || "")),
-      relativePath,
-      filePath,
-      extHeader: String(payload.extHeader || ""),
-      expectedBytes: Number(payload.size || 0),
-      totalBytes: Number(payload.size || 0),
-      downloadedBytes: 0,
-      speedBytesPerSecond: 0,
-      status: "queued",
-      abortController: new AbortController()
-    };
-
-    activeDownloads.set(task.id, task);
-    task.promise = performNativeDownload(task);
-    return { ok: true, id: task.id };
-  }
-
-  async function downloadFileOnce(rawPayload = {}) {
-    const payload = normalizeDownloadPayloadArgs(rawPayload);
-    const relativePath = normalizeRelativeDownloadPath(
-      payload.relativePath || payload.pathId || `${payload.id || "download-sync"}${guessFileExtensionFromUrl(payload.url)}`
-    );
-    const downloadDir =
-      normalizeStorageTarget(payload.downloadDir) ||
-      normalizeStorageTarget(payload.basePath) ||
-      app.getPath("downloads");
-    const filePath = resolveDownloadFilePath(downloadDir, relativePath);
-    if (!payload.url || !filePath) {
-      return { type: -101, path: relativePath };
-    }
-
-    const headers = await buildDownloadHeaders(payload.url, payload.extHeader);
-    const response = await fetch(payload.url, {
-      method: "GET",
-      headers
-    });
-    if (!response.ok) {
-      return { type: -101, path: relativePath };
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    await ensureDir(path.dirname(filePath));
-    await fsp.writeFile(filePath, bytes);
-    return { type: 0, path: relativePath };
-  }
-
-  async function listDownloadFilesForScan(baseDir, excludePathList = []) {
-    const normalizedBaseDir = String(baseDir || app.getPath("downloads"));
-    const excluded = new Set(
-      (Array.isArray(excludePathList) ? excludePathList : [])
-        .map((entry) => normalizeRelativeDownloadPath(String(entry || "")))
-        .filter(Boolean)
-    );
-    const results = [];
-
-    async function walk(currentDir) {
-      let entries = [];
-      try {
-        entries = await fsp.readdir(currentDir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-
-      for (const entry of entries) {
-        const entryPath = path.join(currentDir, entry.name);
-        if (entry.isDirectory()) {
-          await walk(entryPath);
-          continue;
-        }
-
-        const relativePath = normalizeRelativeDownloadPath(path.relative(normalizedBaseDir, entryPath));
-        if (!relativePath || excluded.has(relativePath)) {
-          continue;
-        }
-
-        let stat;
-        try {
-          stat = await fsp.stat(entryPath);
-        } catch {
-          continue;
-        }
-
-        results.push({
-          path: relativePath,
-          size: stat.size,
-          creationTime: stat.mtimeMs,
-          comment: ""
-        });
-      }
-    }
-
-    await walk(normalizedBaseDir);
-    return results;
-  }
-
-  function getDownloadTaskByPayload(payload = {}) {
-    const id =
-      typeof payload === "string"
-        ? payload
-        : typeof payload?.id === "string"
-          ? payload.id
-          : typeof payload?.downloadId === "string"
-            ? payload.downloadId
-            : "";
-    return id ? activeDownloads.get(id) : null;
-  }
-
-  function flattenInvokeArgs(argsLike = []) {
-    const source = Array.isArray(argsLike) ? argsLike : [argsLike];
-    const flattened = [];
-    for (const entry of source) {
-      if (Array.isArray(entry)) {
-        flattened.push(...flattenInvokeArgs(entry));
-      } else {
-        flattened.push(entry);
-      }
-    }
-    return flattened;
-  }
-
-  function normalizeDownloadPayloadArgs(argsLike = []) {
-    const args = flattenInvokeArgs(argsLike);
-    const objectArgs = args.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry));
-    const mergedObject = Object.assign({}, ...objectArgs);
-
-    const idCandidate =
-      mergedObject.id ||
-      mergedObject.downloadId ||
-      (typeof args[0] === "string" ? args[0] : "") ||
-      "";
-
-    const urlCandidate =
-      mergedObject.url ||
-      mergedObject.downloadUrl ||
-      mergedObject.musicurl ||
-      "";
-
-    const relativePathCandidate =
-      mergedObject.relativePath ||
-      mergedObject.rel_path ||
-      mergedObject.relPath ||
-      mergedObject.path ||
-      mergedObject.targetPath ||
-      mergedObject.filePath ||
-      mergedObject.finalPath ||
-      "";
-
-    const extHeaderCandidate =
-      mergedObject.extHeader ||
-      mergedObject.ext_header ||
-      mergedObject.headers ||
-      mergedObject.extraHeader ||
-      "";
-
-    const sizeCandidate =
-      mergedObject.size ||
-      mergedObject.total ||
-      mergedObject.contentLength ||
-      0;
-
-    const prePathCandidate =
-      mergedObject.prePath ||
-      mergedObject.pre_path ||
-      mergedObject.tmpPath ||
-      "";
-
-    return {
-      ...mergedObject,
-      id: String(idCandidate || ""),
-      url: String(urlCandidate || ""),
-      relativePath: String(relativePathCandidate || ""),
-      prePath: String(prePathCandidate || ""),
-      extHeader:
-        typeof extHeaderCandidate === "string"
-          ? extHeaderCandidate
-          : extHeaderCandidate && typeof extHeaderCandidate === "object"
-            ? JSON.stringify(extHeaderCandidate)
-            : "",
-      size: Number(sizeCandidate || 0)
-    };
-  }
-
   function normalizeStorageCheckFilesExistArgs(argsLike = []) {
-    const args = flattenInvokeArgs(argsLike);
-    const [firstArg, secondArg, thirdArg] = args;
+    const source = Array.isArray(argsLike) ? argsLike.flat(Infinity) : [argsLike];
+    const [firstArg, secondArg, thirdArg] = source;
     if (firstArg && typeof firstArg === "object" && !Array.isArray(firstArg)) {
       return {
         files: Array.isArray(firstArg.files) ? firstArg.files : [],
@@ -2219,36 +1367,6 @@ function createNativeApi(options) {
     return {
       files: Array.isArray(secondArg) ? secondArg : Array.isArray(firstArg) ? firstArg : [],
       baseDir: String(thirdArg || app.getPath("downloads"))
-    };
-  }
-
-  function normalizeDownloadProcessQueryArgs(argsLike = []) {
-    const args = flattenInvokeArgs(argsLike);
-    const [firstArg, secondArg] = args;
-    if (Array.isArray(firstArg)) {
-      return firstArg;
-    }
-    if (firstArg && typeof firstArg === "object" && Array.isArray(firstArg.items)) {
-      return firstArg.items;
-    }
-    if (Array.isArray(secondArg)) {
-      return secondArg;
-    }
-    return [];
-  }
-
-  function normalizeStartScanDownloadArgs(argsLike = []) {
-    const args = flattenInvokeArgs(argsLike);
-    const [firstArg, secondArg, thirdArg] = args;
-    if (firstArg && typeof firstArg === "object" && !Array.isArray(firstArg)) {
-      return {
-        path: String(firstArg.path || app.getPath("downloads")),
-        excludePath: Array.isArray(firstArg.excludePath) ? firstArg.excludePath : []
-      };
-    }
-    return {
-      path: String((typeof secondArg === "string" ? secondArg : thirdArg) || firstArg || app.getPath("downloads")),
-      excludePath: Array.isArray(thirdArg) ? thirdArg : Array.isArray(secondArg) ? secondArg : []
     };
   }
 
@@ -2611,6 +1729,73 @@ function createNativeApi(options) {
 
     return false;
   }
+
+  const sessionRuntime = createSessionRuntime({
+    app,
+    logger,
+    normalizeDataValue,
+    readCookies,
+    setCookie,
+    removeCookie,
+    buildSessionBootstrapState,
+    syncPersistentHost,
+    initializeSessionState
+  });
+
+  const networkHandlers = createNetworkHandlers({
+    fetchWithSessionCookies
+  });
+
+  const storageHandlers = createStorageHandlers({
+    app,
+    cacheRoot,
+    tempRoot,
+    storageRoot,
+    userDataRoot,
+    logger,
+    emitNativeEvent,
+    path,
+    fsp,
+    session,
+    normalizeJsonText,
+    maybeRepairUtf8Mojibake,
+    normalizeAssetUrl,
+    ensureDir,
+    pathExists,
+    hashString,
+    guessFileExtensionFromUrl,
+    runStorageSql,
+    executeSqlite,
+    normalizeStorageTarget,
+    storageTargetFromPathMode,
+    readTextFile,
+    writeTextFile,
+    deleteTarget,
+    listTarget,
+    maybeSanitizeHomePageEcpmStorageText,
+    normalizeStorageCheckFilesExistArgs,
+    resolveDownloadFilePath,
+    normalizeRelativeDownloadPath,
+    moveFileIfNeeded,
+    downloadManager
+  });
+
+  const windowHandlers = createWindowHandlers({
+    Menu,
+    dialog,
+    globalShortcut,
+    app,
+    settings,
+    saveSettings,
+    emitNativeEvent,
+    currentWindow,
+    normalizeDataValue,
+    normalizeMenuCoordinates,
+    normalizeMenuInput,
+    buildPopupMenuTemplate,
+    showPopupMenu,
+    createWindow
+  });
 
   const handlers = {
     "app.log": async (message) => {
@@ -3009,72 +2194,12 @@ function createNativeApi(options) {
       };
     },
     "storage.querydownloadingprocess": async (...args) => {
-      const inputItems = normalizeDownloadProcessQueryArgs(args);
-      return inputItems.map((entry) => {
-        const task = activeDownloads.get(String(entry?.id || ""));
-        if (!task) {
-          return {
-            id: String(entry?.id || ""),
-            path: String(entry?.path || ""),
-            progress: 0
-          };
-        }
-        const snapshot = getDownloadStateSnapshot(task);
-        return {
-          id: task.id,
-          path: entry?.path || task.relativePath,
-          progress: snapshot.progress,
-          download: snapshot.download,
-          total: snapshot.total,
-          speed: snapshot.speed
-        };
-      });
+      return downloadManager.queryDownloadProgress(args);
     },
-    "storage.startscandownload": async (...args) => {
-      const { path: baseDir, excludePath } = normalizeStartScanDownloadArgs(args);
-      const entries = await listDownloadFilesForScan(baseDir, excludePath);
-      logger.log(
-        "[native:download:scan]",
-        JSON.stringify({
-          path: baseDir,
-          excludeCount: excludePath.length,
-          found: entries.length
-        })
-      );
-      emitNativeEvent("storage.ondownloadscan", entries);
-      return entries;
-    },
-    "storage.subscribecopyncmprocess": async (payload = {}) => {
-      if (typeof payload?.callback === "function") {
-        copyNcmSubscribers.add(payload.callback);
-      }
-      return true;
-    },
-    "storage.copyncm": async (payload = {}) => {
-      const srcFiles = Array.isArray(payload?.srcFiles) ? payload.srcFiles : [];
-      const destFiles = Array.isArray(payload?.destFiles) ? payload.destFiles : [];
-      const copied = [];
-      for (let index = 0; index < Math.min(srcFiles.length, destFiles.length); index += 1) {
-        const src = String(srcFiles[index] || "");
-        const dst = String(destFiles[index] || "");
-        if (!src || !dst) {
-          continue;
-        }
-        await ensureDir(path.dirname(dst));
-        await fsp.copyFile(src, dst);
-        const eventPayload = { type: "copyncm", code: 0, src, dst };
-        copied.push(eventPayload);
-        emitNativeEvent("storage.oncopyncmprocess", eventPayload);
-        for (const callback of copyNcmSubscribers) {
-          try {
-            callback(eventPayload);
-          } catch {
-            // ignore renderer callback failure
-          }
-        }
-      }
-      return copied;
-    },
+    "storage.startscandownload": async (...args) => downloadManager.scanDownloads(args),
+    "storage.subscribecopyncmprocess": async (payload = {}) =>
+      downloadManager.subscribeCopyNcmProcess(payload),
+    "storage.copyncm": async (payload = {}) => downloadManager.copyNcmFiles(payload),
     "storage.copyfiles": async (payload = {}) => {
       const srcFiles = Array.isArray(payload?.srcFiles || payload?.sources)
         ? payload.srcFiles || payload.sources
@@ -3100,7 +2225,7 @@ function createNativeApi(options) {
     },
     "storage.offlinetrack": async (payload = {}) => {
       try {
-        return await startNativeDownload(payload);
+        return await downloadManager.startNativeDownload(payload);
       } catch (error) {
         logger.warn("[native:storage.offlinetrack]", error?.message || error);
         return {
@@ -3316,69 +2441,13 @@ function createNativeApi(options) {
     "network.diagnostic": async () => ({ ok: true }),
     "network.getenv": async () => ({ offline: false }),
     "network.getnetworkquality": async () => ({ score: 100, label: "unknown" }),
-    "download.start": async (payload = {}) => startNativeDownload(payload),
-    "download.download": async (payload = {}) => startNativeDownload(payload),
-    "download.pause": async (payload = {}) => {
-      const task = getDownloadTaskByPayload(normalizeDownloadPayloadArgs(payload));
-      if (!task) {
-        return true;
-      }
-      task.status = "paused";
-      task.abortController.abort();
-      return true;
-    },
-    "download.cancel": async (payload = {}) => {
-      const task = getDownloadTaskByPayload(normalizeDownloadPayloadArgs(payload));
-      if (!task) {
-        return true;
-      }
-      task.status = "cancelled";
-      task.abortController.abort();
-      return true;
-    },
-    "download.querydownloadshecdule": async (...args) => {
-      const inputItems = normalizeDownloadProcessQueryArgs(args);
-      return inputItems
-        .map((entry) => {
-          const task = activeDownloads.get(String(entry?.id || ""));
-          if (!task) {
-            return null;
-          }
-          const snapshot = getDownloadStateSnapshot(task);
-          return {
-            id: task.id,
-            path: entry?.path || task.relativePath,
-            progress: snapshot.progress,
-            download: snapshot.download,
-            total: snapshot.total,
-            speed: snapshot.speed
-          };
-        })
-        .filter(Boolean);
-    },
-    "download.downloadsync": async (payload = {}) => downloadFileOnce(payload),
-    "download.querydownloadingprocess": async (...args) => {
-      const inputItems = normalizeDownloadProcessQueryArgs(args);
-      return inputItems.map((entry) => {
-        const task = activeDownloads.get(String(entry?.id || ""));
-        if (!task) {
-          return {
-            id: String(entry?.id || ""),
-            path: String(entry?.path || ""),
-            progress: 0
-          };
-        }
-        const snapshot = getDownloadStateSnapshot(task);
-        return {
-          id: task.id,
-          path: entry?.path || task.relativePath,
-          progress: snapshot.progress,
-          download: snapshot.download,
-          total: snapshot.total,
-          speed: snapshot.speed
-        };
-      });
-    },
+    "download.start": async (payload = {}) => downloadManager.startNativeDownload(payload),
+    "download.download": async (payload = {}) => downloadManager.startNativeDownload(payload),
+    "download.pause": async (payload = {}) => downloadManager.pauseDownload(payload),
+    "download.cancel": async (payload = {}) => downloadManager.cancelDownload(payload),
+    "download.querydownloadshecdule": async (...args) => downloadManager.queryDownloadSchedule(args),
+    "download.downloadsync": async (payload = {}) => downloadManager.downloadFileOnce(payload),
+    "download.querydownloadingprocess": async (...args) => downloadManager.queryDownloadProgress(args),
     "player.setsmtcenable": async () => true,
     "player.setminiplayerstate": async (payload = {}) => {
       playerRuntimeState.miniPlayerState = normalizeDataValue(payload);
@@ -3547,7 +2616,11 @@ function createNativeApi(options) {
     "audioplayer.subscribedeskmousewheel": async () => true,
     "audioplayer.subscribedesklyricfontsize": async () => true,
     "audioplayer.subscribeminimodecloseapp": async () => true,
-    "storage.downloadscanner": async () => []
+    "storage.downloadscanner": async () => [],
+    ...sessionRuntime.createHandlers(),
+    ...networkHandlers,
+    ...storageHandlers,
+    ...windowHandlers
   };
 
   async function invoke(command, args = [], context = {}) {
@@ -3587,7 +2660,7 @@ function createNativeApi(options) {
     cacheRoot,
     extractedRoot,
     generatedPath,
-    initialize: initializeSessionState,
+    initialize: sessionRuntime.initialize,
     invoke,
     emitNativeEvent,
     resolveOrpheusPath,

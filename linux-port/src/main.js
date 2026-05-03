@@ -2,10 +2,13 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { app, BrowserWindow, ipcMain, protocol, net, shell, session } = require("electron");
+const { app, BrowserWindow, ipcMain, net, protocol } = require("electron");
 
+const { runBootDiagnostics } = require("./main/boot-diagnostics");
+const { ORPHEUS_SCHEME, registerOrpheusProtocol } = require("./main/protocol");
+const { configureSession } = require("./main/session-runtime");
+const { createWindowManager } = require("./main/window-manager");
 const { createNativeApi } = require("./native-api");
-const { ORPHEUS_SCHEME, registerOrpheusProtocol } = require("./protocol");
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -32,7 +35,6 @@ const assetRoot = process.env.NETEASE_ASSET_ROOT
   : path.join(projectRoot, "extracted", "orpheus_pkg", "pub");
 const extractedRoot = path.join(projectRoot, "extracted");
 const debugRoot = path.join(linuxPortRoot, "debug");
-const appVersion = detectAppVersion();
 const sharedWebPreferences = {
   preload: path.join(__dirname, "preload.js"),
   contextIsolation: false,
@@ -41,11 +43,8 @@ const sharedWebPreferences = {
   webSecurity: false
 };
 
-let mainWindow = null;
 let nativeApi = null;
 let rendererLogFile = null;
-const childWindows = new Set();
-const childWindowsByKey = new Map();
 
 function readTextIfExists(filePath) {
   try {
@@ -79,136 +78,6 @@ function detectAppVersion() {
   return "3.1.32.205206";
 }
 
-function parseWindowFeatures(features = "") {
-  const entries = {};
-  for (const item of String(features || "").split(",")) {
-    const [rawKey, rawValue] = item.split("=");
-    const key = String(rawKey || "").trim();
-    if (!key) {
-      continue;
-    }
-    entries[key] = String(rawValue || "").trim();
-  }
-
-  const numberOrUndefined = (value) => {
-    if (!value) {
-      return undefined;
-    }
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? Math.round(parsed) : undefined;
-  };
-
-  return {
-    width: numberOrUndefined(entries.width),
-    height: numberOrUndefined(entries.height),
-    x: numberOrUndefined(entries.left ?? entries.x),
-    y: numberOrUndefined(entries.top ?? entries.y)
-  };
-}
-
-function wireAuxiliaryWindow(win) {
-  if (!win || win.isDestroyed()) {
-    return;
-  }
-
-  childWindows.add(win);
-
-  win.webContents.setWindowOpenHandler(({ url, features }) => {
-    if (url.startsWith(`${ORPHEUS_SCHEME}://`)) {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          width: 440,
-          height: 720,
-          minWidth: 360,
-          minHeight: 320,
-          autoHideMenuBar: true,
-          backgroundColor: "#1a1d21",
-          parent: win,
-          modal: false,
-          show: true,
-          webPreferences: {
-            ...sharedWebPreferences
-          },
-          ...parseWindowFeatures(features)
-        }
-      };
-    }
-
-    shell.openExternal(url);
-    return { action: "deny" };
-  });
-
-  win.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith(`${ORPHEUS_SCHEME}://`)) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
-  });
-
-  win.on("closed", () => {
-    childWindows.delete(win);
-    for (const [key, candidate] of childWindowsByKey.entries()) {
-      if (candidate === win) {
-        childWindowsByKey.delete(key);
-      }
-    }
-  });
-}
-
-function getWindowKeyFromUrl(rawUrl) {
-  try {
-    const target = new URL(rawUrl);
-    return target.searchParams.get("uuid") || target.searchParams.get("main") || rawUrl;
-  } catch {
-    return rawUrl;
-  }
-}
-
-function createAuxiliaryWindow({ url, bounds = {}, options = {}, parentWindow = null }) {
-  const key = getWindowKeyFromUrl(url);
-  const existingWindow = childWindowsByKey.get(key);
-  if (existingWindow && !existingWindow.isDestroyed()) {
-    existingWindow.loadURL(url);
-    if (options.visible !== false) {
-      existingWindow.show();
-      existingWindow.focus();
-    }
-    return {
-      id: existingWindow.id,
-      key
-    };
-  }
-
-  const win = new BrowserWindow({
-    width: Math.max(320, Math.round(bounds.width || 440)),
-    height: Math.max(240, Math.round(bounds.height || 720)),
-    x: Number.isFinite(Number(bounds.x)) ? Math.round(bounds.x) : undefined,
-    y: Number.isFinite(Number(bounds.y)) ? Math.round(bounds.y) : undefined,
-    show: options.visible !== false,
-    resizable: options.resizable !== false,
-    minimizable: false,
-    maximizable: options.resizable !== false,
-    skipTaskbar: options.taskbarButton === false,
-    autoHideMenuBar: true,
-    backgroundColor: options.bk_color || "#1a1d21",
-    parent: parentWindow && !parentWindow.isDestroyed() ? parentWindow : mainWindow,
-    modal: Boolean(options.spec_window),
-    webPreferences: {
-      ...sharedWebPreferences
-    }
-  });
-
-  childWindowsByKey.set(key, win);
-  wireAuxiliaryWindow(win);
-  win.loadURL(url);
-
-  return {
-    id: win.id,
-    key
-  };
-}
-
 function summarizeValue(value) {
   if (value === null || typeof value === "undefined") {
     return value;
@@ -234,96 +103,6 @@ function summarizeValue(value) {
   return preview;
 }
 
-function configureSession() {
-  const defaultSession = session.defaultSession;
-  const corsFilter = {
-    urls: [
-      "https://*.music.163.com/*",
-      "http://clientlog.music.163.com/*",
-      "https://*.126.net/*",
-      "https://*.netease.com/*"
-    ]
-  };
-  const canonicalOrigin = "https://music.163.com";
-  const canonicalReferer = "https://music.163.com/";
-
-  const readHeader = (headers, key) => headers[key] || headers[key.toLowerCase()];
-  const setHeaderPair = (headers, key, value) => {
-    headers[key] = value;
-    headers[key.toLowerCase()] = value;
-  };
-  const isOrpheusHeader = (value) =>
-    typeof value === "string" && value.startsWith(`${ORPHEUS_SCHEME}://`);
-  const needsCanonicalSiteHeaders = (details, headers) => {
-    const originHeader = readHeader(headers, "Origin");
-    const refererHeader = readHeader(headers, "Referer");
-    if (isOrpheusHeader(originHeader) || isOrpheusHeader(refererHeader)) {
-      return true;
-    }
-
-    const requestUrl = String(details.url || "");
-    if (!/^https:\/\/[^/]+\.(music\.126\.net|126\.net)(\/|$)/i.test(requestUrl)) {
-      return false;
-    }
-
-    const destination =
-      details.resourceType ||
-      readHeader(headers, "Sec-Fetch-Dest") ||
-      readHeader(headers, "sec-fetch-dest") ||
-      "";
-    return ["image", "media", "audio"].includes(String(destination).toLowerCase());
-  };
-
-  defaultSession.webRequest.onBeforeSendHeaders(corsFilter, (details, callback) => {
-    const headers = {
-      ...details.requestHeaders
-    };
-    if (needsCanonicalSiteHeaders(details, headers)) {
-      setHeaderPair(headers, "Origin", canonicalOrigin);
-      setHeaderPair(headers, "Referer", canonicalReferer);
-    }
-    callback({ requestHeaders: headers });
-  });
-
-  defaultSession.webRequest.onHeadersReceived(corsFilter, (details, callback) => {
-    const responseHeaders = {
-      ...(details.responseHeaders || {})
-    };
-    const allowOrigin = details.requestHeaders?.Origin || details.requestHeaders?.origin || "*";
-    responseHeaders["Access-Control-Allow-Origin"] = [allowOrigin];
-    responseHeaders["Access-Control-Allow-Credentials"] = ["true"];
-    responseHeaders["Access-Control-Allow-Headers"] = ["*"];
-    responseHeaders["Access-Control-Allow-Methods"] = ["GET, POST, PUT, DELETE, OPTIONS"];
-    callback({ responseHeaders });
-  });
-
-  if (process.env.NETEASE_DEBUG_BOOT) {
-    defaultSession.webRequest.onCompleted((details) => {
-      const url = details.url || "";
-      if (
-        url.startsWith("orpheus://") ||
-        url.includes("music.163.com") ||
-        url.includes("music.126.net") ||
-        url.includes("netease.com")
-      ) {
-        console.log("[request:completed]", details.method, details.statusCode, url);
-      }
-    });
-
-    defaultSession.webRequest.onErrorOccurred((details) => {
-      const url = details.url || "";
-      if (
-        url.startsWith("orpheus://") ||
-        url.includes("music.163.com") ||
-        url.includes("music.126.net") ||
-        url.includes("netease.com")
-      ) {
-        console.error("[request:error]", details.method, details.error, url);
-      }
-    });
-  }
-}
-
 function appendRendererLog(entry) {
   if (!rendererLogFile) {
     return;
@@ -335,350 +114,7 @@ function appendRendererLog(entry) {
   }
 }
 
-async function runBootDiagnostics() {
-  if (!process.env.NETEASE_DEBUG_BOOT || !mainWindow || mainWindow.isDestroyed()) {
-    return;
-  }
-
-  await fs.promises.mkdir(debugRoot, { recursive: true });
-
-  try {
-    const page = await mainWindow.webContents.capturePage();
-    await fs.promises.writeFile(path.join(debugRoot, "boot.png"), page.toPNG());
-  } catch (error) {
-    console.error("[debug:boot:capture-failed]", error);
-  }
-
-  try {
-    const payload = await mainWindow.webContents.executeJavaScript(
-      `(async () => {
-        const root = document.querySelector("#root");
-        const body = document.body;
-        const trim = (value) => typeof value === "string" ? value.trim() : "";
-        const text = trim(root?.innerText || body?.innerText || "");
-        return {
-          href: location.href,
-          title: document.title,
-          readyState: document.readyState,
-          pathname: location.pathname,
-          rootTag: root?.tagName || null,
-          rootExists: Boolean(root),
-          rootChildCount: root?.childElementCount || 0,
-          rootHtmlLength: root?.innerHTML?.length || 0,
-          rootReactKeys: root
-            ? Object.getOwnPropertyNames(root).filter((key) => key.startsWith("__react")).slice(0, 20)
-            : [],
-          gAppExists: Boolean(window.g_app),
-          gAppKeys: window.g_app ? Object.keys(window.g_app).slice(0, 20) : [],
-          storeKeys: window.g_app?.store?.getState ? Object.keys(window.g_app.store.getState()) : [],
-          historyLocation:
-            window.g_app?.history?.location
-              ? {
-                  pathname: window.g_app.history.location.pathname,
-                  search: window.g_app.history.location.search,
-                  hash: window.g_app.history.location.hash
-                }
-              : null,
-          performanceResources:
-            typeof performance?.getEntriesByType === "function"
-              ? performance
-                  .getEntriesByType("resource")
-                  .slice(-30)
-                  .map((entry) => ({
-                    name: entry.name,
-                    initiatorType: entry.initiatorType,
-                    duration: Math.round(entry.duration),
-                    transferSize: entry.transferSize || 0
-                  }))
-              : [],
-          localStorageKeys:
-            window.localStorage
-              ? Object.keys(window.localStorage).sort().slice(0, 40)
-              : [],
-          viewport: {
-            width: window.innerWidth,
-            height: window.innerHeight,
-            devicePixelRatio: window.devicePixelRatio || 1
-          },
-          bodyStyle: body
-            ? (() => {
-                const style = window.getComputedStyle(body);
-                return {
-                  backgroundColor: style.backgroundColor,
-                  color: style.color,
-                  opacity: style.opacity,
-                  visibility: style.visibility
-                };
-              })()
-            : null,
-          rootStyle: root
-            ? (() => {
-                const style = window.getComputedStyle(root);
-                const rect = root.getBoundingClientRect();
-                return {
-                  display: style.display,
-                  opacity: style.opacity,
-                  visibility: style.visibility,
-                  color: style.color,
-                  backgroundColor: style.backgroundColor,
-                  rect: {
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height)
-                  }
-                };
-              })()
-            : null,
-          topElementAtCenter: (() => {
-            const target = document.elementFromPoint(
-              Math.max(0, Math.floor(window.innerWidth / 2)),
-              Math.max(0, Math.floor(window.innerHeight / 2))
-            );
-            return target
-              ? {
-                  tag: target.tagName,
-                  id: target.id || "",
-                  className: target.className || "",
-                  text: trim(target.innerText || "").slice(0, 120)
-                }
-              : null;
-          })(),
-          visibleTextSamples: Array.from(document.querySelectorAll("body *"))
-            .map((element) => {
-              const textContent = trim(element.innerText || "");
-              if (!textContent) {
-                return null;
-              }
-              const style = window.getComputedStyle(element);
-              const rect = element.getBoundingClientRect();
-              return {
-                tag: element.tagName,
-                id: element.id || "",
-                className: String(element.className || "").slice(0, 120),
-                text: textContent.slice(0, 80),
-                display: style.display,
-                visibility: style.visibility,
-                opacity: style.opacity,
-                color: style.color,
-                rect: {
-                  x: Math.round(rect.x),
-                  y: Math.round(rect.y),
-                  width: Math.round(rect.width),
-                  height: Math.round(rect.height)
-                }
-              };
-            })
-            .filter(Boolean)
-            .slice(0, 20),
-          webpackProbe: await (async () => {
-            try {
-              let req = null;
-              if (Array.isArray(window.webpackJsonp) && typeof window.webpackJsonp.push === "function") {
-                const probeChunkId = 900001;
-                const probeModuleId = 900002;
-                window.webpackJsonp.push([
-                  [probeChunkId],
-                  {
-                    [probeModuleId]: function captureWebpackRequire(module, exports, nextRequire) {
-                      req = nextRequire;
-                    }
-                  },
-                  [[probeModuleId]]
-                ]);
-              }
-              if (!req) {
-                return {
-                  available: false
-                };
-              }
-              const modelModule = req(1307);
-              const modelEntries = Array.isArray(modelModule?.default) ? modelModule.default : [];
-              const asyncHelper = req(151);
-              const appContextModule = req(16);
-              const appContext = appContextModule?.getAppContext?.();
-              const dvaTool = req(11)?.a;
-              const apiModule = req(15);
-              const homeModule = req(203);
-              const storeState = dvaTool?.app?._store?.getState ? dvaTool.app._store.getState() : null;
-              const selectedApiKeys = ["Qb", "Xg", "ge", "oc", "pc", "ke", "ie", "he", "ac", "mi", "Me"];
-              const selectedHomeKeys = ["b", "j", "f", "g", "i", "l", "h", "q"];
-              const selectedModelNamespaces = [
-                "page:essential",
-                "page:banners",
-                "page:ranklist",
-                "page:verticalZone",
-                "page:artistsGallery",
-                "page:vipEssential",
-                "page:playlistsquare"
-              ];
-              const modelPreview = [];
-              for (const entry of modelEntries.slice(0, 20)) {
-                const [loader, namespace] = entry;
-                let contextProbe = "skipped";
-                let loaderProbe = "skipped";
-                if (typeof loader === "function" && asyncHelper && typeof asyncHelper.b === "function") {
-                  contextProbe = await Promise.race([
-                    Promise.resolve()
-                      .then(() => asyncHelper.b({ namespace }))
-                      .then(() => "resolved")
-                      .catch((error) => "error:" + (error?.message || String(error))),
-                    new Promise((resolve) => setTimeout(() => resolve("timeout"), 200))
-                  ]);
-                }
-                if (typeof loader === "function") {
-                  loaderProbe = await Promise.race([
-                    Promise.resolve()
-                      .then(() => loader())
-                      .then((result) =>
-                        result && typeof result === "object" && "namespace" in result
-                          ? "resolved:" + result.namespace
-                          : "resolved"
-                      )
-                      .catch((error) => "error:" + (error?.message || String(error))),
-                    new Promise((resolve) => setTimeout(() => resolve("timeout"), 250))
-                  ]);
-                }
-                modelPreview.push({
-                  namespace,
-                  loaderType: typeof loader,
-                  loaderSource:
-                    typeof loader === "function" ? String(loader).slice(0, 180) : String(loader).slice(0, 180),
-                  contextProbe,
-                  loaderProbe
-                });
-              }
-              return {
-                available: true,
-                modelCount: modelEntries.length,
-                asyncHelperKeys: asyncHelper ? Object.keys(asyncHelper).slice(0, 20) : [],
-                appContextAvailable: Boolean(appContext),
-                appContextKeys: appContext ? Object.keys(appContext).slice(0, 20) : [],
-                appStoreStateKeys:
-                  appContext?.app?._store?.getState
-                    ? Object.keys(appContext.app._store.getState())
-                    : [],
-                appRouterDefined: Boolean(appContext?.app?._router),
-                appStartedFlag: Boolean(appContext?.app?._started),
-                appHistoryLocation:
-                  appContext?.history?.location
-                    ? {
-                        pathname: appContext.history.location.pathname,
-                        search: appContext.history.location.search,
-                        hash: appContext.history.location.hash
-                      }
-                    : null,
-                dvaToolInited: Boolean(dvaTool?.inited),
-                dvaToolHasApp: Boolean(dvaTool?.app),
-                dvaToolHasHistory: Boolean(dvaTool?.history),
-                dvaToolStoreKeys:
-                  dvaTool?.app?._store?.getState ? Object.keys(dvaTool.app._store.getState()) : [],
-                storeSlices: storeState
-                  ? {
-                      homePage: storeState["page:homePage"],
-                      banners: storeState["page:banners"],
-                      essential: storeState["page:essential"],
-                      ranklist: storeState["page:ranklist"],
-                      verticalZone: storeState["page:verticalZone"],
-                      artistsGallery: storeState["page:artistsGallery"],
-                      vipEssential: storeState["page:vipEssential"],
-                      host: storeState.host
-                    }
-                  : null,
-                apiModuleKeys: apiModule ? Object.keys(apiModule).slice(0, 80) : [],
-                apiModulePreview: apiModule
-                  ? Object.fromEntries(
-                      Object.entries(apiModule)
-                        .slice(0, 30)
-                        .map(([key, value]) => [
-                          key,
-                          typeof value === "function" ? String(value).slice(0, 200) : typeof value
-                        ])
-                    )
-                  : null,
-                apiModuleSelectedPreview: apiModule
-                  ? Object.fromEntries(
-                      selectedApiKeys.map((key) => [
-                        key,
-                        typeof apiModule[key] === "function"
-                          ? String(apiModule[key]).slice(0, 600)
-                          : apiModule[key]
-                      ])
-                    )
-                  : null,
-                homeModuleKeys: homeModule ? Object.keys(homeModule).slice(0, 40) : [],
-                homeModulePreview: homeModule
-                  ? Object.fromEntries(
-                      Object.entries(homeModule)
-                        .slice(0, 20)
-                        .map(([key, value]) => [
-                          key,
-                          typeof value === "function" ? String(value).slice(0, 200) : value
-                        ])
-                    )
-                  : null,
-                homeModuleSelectedPreview: homeModule
-                  ? Object.fromEntries(
-                      selectedHomeKeys.map((key) => [
-                        key,
-                        typeof homeModule[key] === "function"
-                          ? String(homeModule[key]).slice(0, 800)
-                          : homeModule[key]
-                      ])
-                    )
-                  : null,
-                selectedModelLoaders: Object.fromEntries(
-                  selectedModelNamespaces.map((namespace) => {
-                    const entry = modelEntries.find((candidate) => candidate[1] === namespace);
-                    const loader = entry?.[0];
-                    return [
-                      namespace,
-                      loader
-                        ? {
-                            loaderType: typeof loader,
-                            loaderSource: String(loader).slice(0, 1200)
-                          }
-                        : null
-                    ];
-                  })
-                ),
-                modelPreview
-              };
-            } catch (error) {
-              return {
-                available: true,
-                error: error?.message || String(error),
-                stack: error?.stack || null
-              };
-            }
-          })(),
-          bodyChildren: body
-            ? Array.from(body.children).map((node) => ({
-                tag: node.tagName,
-                id: node.id || "",
-                className: typeof node.className === "string" ? node.className : "",
-                textLength: trim(node.textContent || "").length
-              }))
-            : [],
-          bodyHtmlLength: body?.innerHTML?.length || 0,
-          bodyPreview: trim(body?.innerHTML || "").slice(0, 400),
-          textLength: text.length,
-          textPreview: text.slice(0, 400)
-        };
-      })();`,
-      true
-    );
-    await fs.promises.writeFile(
-      path.join(debugRoot, "boot.json"),
-      `${JSON.stringify(payload, null, 2)}\n`
-    );
-    console.log("[debug:boot]", JSON.stringify(payload));
-  } catch (error) {
-    console.error("[debug:boot:dom-failed]", error);
-  }
-}
-
-function revealMainWindow() {
+function revealMainWindow(mainWindow) {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return;
   }
@@ -719,7 +155,6 @@ function injectRendererCompatibilityBootstrap(win) {
           if (!candidate || typeof candidate !== "object") {
             return null;
           }
-
           const possibleStores = [
             candidate,
             candidate._store,
@@ -889,10 +324,6 @@ function injectRendererCompatibilityBootstrap(win) {
                   isAutoLogin: true
                 }
               }) || touched;
-            report("switch-user-dispatched", {
-              storeUid: String(host.uid || ""),
-              targetUid: String(sessionBootstrap.host.uid || "")
-            });
           }
 
           const essential = state["page:essential"] || {};
@@ -1031,132 +462,24 @@ function injectRendererCompatibilityBootstrap(win) {
     });
 }
 
-function createMainWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 860,
-    minWidth: 960,
-    minHeight: 640,
-    show: false,
-    autoHideMenuBar: true,
-    title: "NetEase Cloud Music Linux Port",
-    backgroundColor: "#1a1d21",
-    webPreferences: {
-      ...sharedWebPreferences
-    }
-  });
+const appVersion = detectAppVersion();
 
-  mainWindow.webContents.setWindowOpenHandler(({ url, features }) => {
-    if (url.startsWith(`${ORPHEUS_SCHEME}://`)) {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          width: 440,
-          height: 720,
-          minWidth: 360,
-          minHeight: 320,
-          autoHideMenuBar: true,
-          backgroundColor: "#1a1d21",
-          parent: mainWindow,
-          modal: false,
-          show: true,
-          webPreferences: {
-            ...sharedWebPreferences
-          },
-          ...parseWindowFeatures(features)
-        }
-      };
-    }
-
-    shell.openExternal(url);
-    return { action: "deny" };
-  });
-
-  mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith(`${ORPHEUS_SCHEME}://`)) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
-  });
-
-  mainWindow.on("enter-full-screen", () => {
-    nativeApi.emitNativeEvent("winhelper.onFullscreenChange", true);
-  });
-  mainWindow.on("leave-full-screen", () => {
-    nativeApi.emitNativeEvent("winhelper.onFullscreenChange", false);
-  });
-  mainWindow.on("close", () => {
-    nativeApi.emitNativeEvent("winhelper.onSystemRequestCloseWindow");
-    nativeApi.emitNativeEvent("winhelper.onClose");
-  });
-  mainWindow.on("closed", () => {
-    mainWindow = null;
-  });
-
-  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
-    console.error("[load-failed]", errorCode, errorDescription, validatedURL);
-    revealMainWindow();
-  });
-
-  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    console.log(`[renderer:${level}] ${sourceId}:${line} ${message}`);
-  });
-
-  mainWindow.webContents.on("did-create-window", (win) => {
-    wireAuxiliaryWindow(win);
-  });
-
-  if (process.env.NETEASE_DEBUG_BOOT) {
-    mainWindow.webContents.on("did-start-loading", () => {
-      console.log("[webContents] did-start-loading");
-    });
-    mainWindow.webContents.on("did-stop-loading", () => {
-      console.log("[webContents] did-stop-loading");
-    });
-    mainWindow.webContents.on("did-frame-finish-load", (_event, isMainFrame, frameProcessId, frameRoutingId) => {
-      console.log("[webContents] did-frame-finish-load", {
-        isMainFrame,
-        frameProcessId,
-        frameRoutingId,
-        url: mainWindow.webContents.getURL()
-      });
-    });
-    mainWindow.webContents.on("render-process-gone", (_event, details) => {
-      console.error("[webContents] render-process-gone", details);
-    });
-  }
-
-  mainWindow.webContents.on("dom-ready", () => {
-    revealMainWindow();
-    injectRendererCompatibilityBootstrap(mainWindow);
-    setTimeout(() => injectRendererCompatibilityBootstrap(mainWindow), 3000);
-    setTimeout(() => injectRendererCompatibilityBootstrap(mainWindow), 8000);
-    setTimeout(() => injectRendererCompatibilityBootstrap(mainWindow), 12000);
-  });
-
-  mainWindow.webContents.once("did-finish-load", () => {
-    revealMainWindow();
-    injectRendererCompatibilityBootstrap(mainWindow);
-  });
-
-  setTimeout(() => {
-    revealMainWindow();
-  }, 3000);
-
-  setTimeout(() => {
-    runBootDiagnostics();
-  }, 10000);
-
-  mainWindow.loadURL(`${ORPHEUS_SCHEME}://orpheus/pub/app.html`);
-}
+const windowManager = createWindowManager({
+  ORPHEUS_SCHEME,
+  sharedWebPreferences,
+  revealMainWindow,
+  injectRendererCompatibilityBootstrap,
+  runBootDiagnostics: (mainWindow) => runBootDiagnostics(mainWindow, debugRoot),
+  nativeApiRef: () => nativeApi
+});
 
 app.whenReady().then(async () => {
   nativeApi = createNativeApi({
     app,
-    mainWindowRef: () => mainWindow,
+    mainWindowRef: () => windowManager.getMainWindow(),
     assetRoot,
     appVersion,
-    createWindow: createAuxiliaryWindow,
+    createWindow: windowManager.createAuxiliaryWindow,
     extractedRoot,
     logger: console
   });
@@ -1168,7 +491,7 @@ app.whenReady().then(async () => {
   rendererLogFile = path.join(app.getPath("userData"), "renderer.log");
 
   registerOrpheusProtocol(protocol, net, nativeApi);
-  configureSession();
+  configureSession({ ORPHEUS_SCHEME });
 
   ipcMain.handle("native:call", async (_event, payload = {}) => {
     const startedAt = Date.now();
@@ -1210,7 +533,7 @@ app.whenReady().then(async () => {
     appendRendererLog(entry);
   });
 
-  createMainWindow();
+  windowManager.createMainWindow();
 });
 
 app.on("window-all-closed", () => {
@@ -1220,7 +543,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", () => {
-  if (!mainWindow) {
-    createMainWindow();
+  if (!windowManager.hasMainWindow()) {
+    windowManager.createMainWindow();
   }
 });
