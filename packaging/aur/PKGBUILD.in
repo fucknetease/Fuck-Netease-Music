@@ -9,11 +9,13 @@ depends=('fuse2' 'gtk3' 'nss' 'libxss')
 optdepends=('xdg-utils: desktop integration helpers')
 provides=('fuck-netease-music')
 conflicts=('fuck-netease-music' 'fuck-netease-music-bin')
+options=('!strip' '!debug')
 source=(
   "__APPIMAGE_URL__"
   "fuck-netease-music.sh"
   "fuck-netease-music.desktop"
 )
+noextract=('fuck-netease-music-x64.AppImage')
 sha256sums=(
   '__APPIMAGE_SHA256__'
   'SKIP'

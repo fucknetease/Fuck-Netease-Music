@@ -7,6 +7,7 @@ url="https://github.com/fucknetease/Fuck-Netease-Music"
 license=('custom')
 depends=('fuse2' 'gtk3' 'nss' 'libxss')
 optdepends=('xdg-utils: desktop integration helpers')
+options=('!strip' '!debug')
 source=(
   'fuck-netease-music.AppImage'
   'fuck-netease-music.sh'
