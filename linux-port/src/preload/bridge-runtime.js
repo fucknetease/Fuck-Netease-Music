@@ -128,6 +128,52 @@ function createBridgeRuntime(options) {
     return next <= limit;
   }
 
+  function shouldTraceEventName(name) {
+    const normalizedName = String(name || "").toLowerCase();
+    if (!normalizedName) {
+      return false;
+    }
+
+    return [
+      "im.",
+      "rtc.",
+      "nimsys.",
+      "listen",
+      "together",
+      "invite",
+      "room",
+      "token",
+      "credential",
+      "agora",
+      "yunxin",
+      "nim"
+    ].some((fragment) => normalizedName.includes(fragment));
+  }
+
+  function summarizeTraceValue(value, depth = 0) {
+    if (depth >= 3) {
+      return "[depth-limit]";
+    }
+
+    if (typeof value === "string") {
+      return value.length > 240 ? `${value.slice(0, 240)}...[trimmed:${value.length}]` : value;
+    }
+
+    if (Array.isArray(value)) {
+      return value.slice(0, 8).map((entry) => summarizeTraceValue(entry, depth + 1));
+    }
+
+    if (value && typeof value === "object") {
+      const output = {};
+      for (const [key, entry] of Object.entries(value).slice(0, 20)) {
+        output[key] = summarizeTraceValue(entry, depth + 1);
+      }
+      return output;
+    }
+
+    return value;
+  }
+
   function buildDownloadProcessCallbackVariants(args) {
     if (!Array.isArray(args) || args.length === 0) {
       return [args];
@@ -227,6 +273,16 @@ function createBridgeRuntime(options) {
   }
 
   function runRegisteredCallbacks(name, args) {
+    if (shouldTraceEventName(name)) {
+      console.log(
+        "[bridge:event:trace]",
+        JSON.stringify({
+          name,
+          args: summarizeTraceValue(args)
+        })
+      );
+    }
+
     const matches = resolveRegisteredCallbacks(name);
     if (matches.length === 0) {
       if (/^download\.|^storage\./.test(String(name || ""))) {

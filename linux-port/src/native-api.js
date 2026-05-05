@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { screen, shell, nativeTheme, dialog, session, globalShortcut, Menu, clipboard } = require("electron");
 const { createDownloadManager } = require("./native-api/download-manager");
+const { createListenTogetherCompat } = require("./native-api/listen-together");
 const { createNetworkHandlers } = require("./native-api/network");
 const { createSessionRuntime } = require("./native-api/session");
 const { createStorageHandlers } = require("./native-api/storage");
@@ -34,6 +35,111 @@ const {
 
 function hashString(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
+}
+
+function encodeRpcBody(apiPath, payloadObject) {
+  return `params=${encodeURIComponent(JSON.stringify([apiPath, JSON.stringify(payloadObject)]))}`;
+}
+
+function patchListenTogetherRpcPayload(rpcBody, context = {}) {
+  if (
+    !rpcBody ||
+    typeof rpcBody !== "object" ||
+    !String(rpcBody.apiPath || "").startsWith("/api/listen/together/")
+  ) {
+    return null;
+  }
+
+  const payloadObject =
+    rpcBody.payloadObject && typeof rpcBody.payloadObject === "object"
+      ? { ...rpcBody.payloadObject }
+      : {};
+  const rawHeader =
+    typeof payloadObject.header === "string" ? safeJsonParse(payloadObject.header, {}) : {};
+  const deviceId = String(context.deviceId || rawHeader.deviceId || rawHeader.clientSign || "");
+  const appVersion = String(context.appVersion || rawHeader.appver || "3.1.32.205206");
+  const osVersion = String(context.osVersion || rawHeader.osver || "");
+  const hostUserId = String(context.hostUserId || payloadObject.userId || "");
+
+  if (rpcBody.apiPath === "/api/listen/together/sync/list/command/report") {
+    const rawPlaylistParam = payloadObject.playlistParam;
+    const playlistParam =
+      typeof rawPlaylistParam === "string" ? safeJsonParse(rawPlaylistParam, null) : rawPlaylistParam;
+
+    if (playlistParam && typeof playlistParam === "object" && Array.isArray(playlistParam.version)) {
+      let didRewriteVersionUser = false;
+      const normalizedVersions = playlistParam.version.map((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return entry;
+        }
+
+        const entryUserId = String(entry.userId ?? "");
+        if (entryUserId || !hostUserId) {
+          return entry;
+        }
+
+        didRewriteVersionUser = true;
+        return {
+          ...entry,
+          userId: hostUserId
+        };
+      });
+
+      if (didRewriteVersionUser) {
+        payloadObject.playlistParam = JSON.stringify({
+          ...playlistParam,
+          version: normalizedVersions
+        });
+      }
+    }
+  }
+
+  payloadObject.e_r = true;
+  payloadObject.header = JSON.stringify({
+    ...rawHeader,
+    os: "pc",
+    appver: appVersion,
+    osver: osVersion,
+    deviceId: deviceId || rawHeader.deviceId || rawHeader.clientSign || "",
+    clientSign: deviceId || rawHeader.clientSign || rawHeader.deviceId || ""
+  });
+
+  return {
+    ...rpcBody,
+    payloadObject,
+    payload: JSON.stringify(payloadObject),
+    encodedBody: encodeRpcBody(rpcBody.apiPath, payloadObject)
+  };
+}
+
+function summarizeListenTogetherResponse(apiPath, text) {
+  if (!String(apiPath || "").startsWith("/api/listen/together/")) {
+    return null;
+  }
+
+  const parsed = safeJsonParse(text, null);
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  const data = parsed.data && typeof parsed.data === "object" ? parsed.data : {};
+  const roomInfo = data.roomInfo && typeof data.roomInfo === "object" ? data.roomInfo : {};
+  const roomUsers = Array.isArray(roomInfo.roomUsers) ? roomInfo.roomUsers : [];
+
+  return {
+    apiPath,
+    code: typeof parsed.code === "number" ? parsed.code : null,
+    message: parsed.message || "",
+    joinable: typeof data.joinable === "boolean" ? data.joinable : null,
+    type: data.type || "",
+    status: data.status || roomInfo.status || "",
+    inRoom: typeof data.inRoom === "boolean" ? data.inRoom : null,
+    roomId: roomInfo.roomId || data.roomId || "",
+    chatRoomId: roomInfo.chatRoomId || "",
+    agoraChannelId: roomInfo.agoraChannelId || "",
+    roomUserCount: roomUsers.length,
+    roomUserIds: roomUsers.slice(0, 5).map((entry) => String(entry?.userId || ""))
+  };
 }
 
 function ensureDirSync(dirPath) {
@@ -437,7 +543,6 @@ function createNativeApi(options) {
     likeMark: 0,
     miniPlayerState: null
   };
-
   if (fs.existsSync(localConfigPath)) {
     localConfig = safeJsonParse(fs.readFileSync(localConfigPath, "utf8"), {});
   }
@@ -982,6 +1087,16 @@ function createNativeApi(options) {
       return;
     }
     window.webContents.send("native:event", { name, args });
+  }
+
+  function emitNativeEventSoon(name, ...args) {
+    setTimeout(() => {
+      try {
+        emitNativeEvent(name, ...args);
+      } catch (error) {
+        logger.warn("[native:event:deferred]", name, error?.message || error);
+      }
+    }, 0);
   }
 
   function resolveOrpheusPath(inputPath) {
@@ -1532,16 +1647,25 @@ function createNativeApi(options) {
       ? `https://interfacepc.music.163.com${request.url}`
       : request.url;
     const url = rewriteRpcUrl(initialUrl);
-    const rpcBody = decodeRpcBody(
+    const decodedRpcBody = decodeRpcBody(
       request.options && typeof request.options.body === "string"
         ? request.options.body
         : ""
     );
+    const rpcBody = patchListenTogetherRpcPayload(decodedRpcBody, {
+      appVersion,
+      osVersion: os.release(),
+      deviceId: settings.deviceId,
+      hostUserId: String(getPersistedHostSnapshot()?.uid || "")
+    }) || decodedRpcBody;
     const apiPath = rpcBody && rpcBody.apiPath ? rpcBody.apiPath : "";
     const shouldSyncCookies = isAuthOrVipApiPath(apiPath);
     const options = {
       ...request.options
     };
+    if (rpcBody?.encodedBody && typeof request.options?.body === "string") {
+      options.body = rpcBody.encodedBody;
+    }
     const headers = {
       ...(options.headers && typeof options.headers === "object" ? options.headers : {})
     };
@@ -1668,6 +1792,13 @@ function createNativeApi(options) {
     if (apiPath === "/api/cellphone/existence/check") {
       text = patchCellphoneExistenceResponse(text, rpcBody);
     }
+    text = patchListenTogetherResponse(
+      apiPath,
+      rpcBody && rpcBody.payloadObject && typeof rpcBody.payloadObject === "object"
+        ? rpcBody.payloadObject
+        : {},
+      text
+    );
 
     const authHost = buildHostFromAuthResponse(apiPath, text, rpcBody);
     if (authHost) {
@@ -1684,6 +1815,10 @@ function createNativeApi(options) {
         textPreview: text.slice(0, 240)
       })
     );
+    const listenTogetherSummary = summarizeListenTogetherResponse(apiPath, text);
+    if (listenTogetherSummary) {
+      logger.log("[native:listenTogether:summary]", JSON.stringify(listenTogetherSummary));
+    }
     return callbackArgs(
       text,
       activeResponse.status,
@@ -1779,6 +1914,22 @@ function createNativeApi(options) {
     moveFileIfNeeded,
     downloadManager
   });
+
+  const listenTogetherCompat = createListenTogetherCompat({
+    logger,
+    emitNativeEventSoon,
+    fs,
+    path,
+    generatedPath
+  });
+
+  function patchListenTogetherResponse(apiPath, payloadObject, text) {
+    if (!String(apiPath || "").startsWith("/api/listen/together/")) {
+      return text;
+    }
+    const hostUserId = String(getPersistedHostSnapshot()?.uid || "");
+    return listenTogetherCompat.noteApiInteraction(apiPath, payloadObject || {}, text, hostUserId);
+  }
 
   const windowHandlers = createWindowHandlers({
     Menu,
@@ -2590,12 +2741,13 @@ function createNativeApi(options) {
     "musiclibrary.readmusicinfo": async () => null,
     "musiclibrary.parsecueinfo": async () => null,
     "musiclibrary.getlibrarypath": async () => [],
-    "im.enter": async () => false,
-    "im.leave": async () => true,
-    "rtc.enter": async () => false,
-    "rtc.leave": async () => true,
-    "nimsys.enter": async () => false,
-    "nimsys.leave": async () => true,
+    "im.enter": async (payload = {}) => listenTogetherCompat.enterIM(payload),
+    "im.leave": async (payload = {}) => listenTogetherCompat.leaveIM(payload),
+    "rtc.enter": async (payload = {}) => listenTogetherCompat.enterRTC(payload),
+    "rtc.leave": async (payload = {}) => listenTogetherCompat.leaveRTC(payload),
+    "nimsys.enter": async (payload = {}) => listenTogetherCompat.enterNimSys(payload),
+    "nimsys.leave": async (payload = {}) => listenTogetherCompat.leaveNimSys(payload),
+    "listen.together.debugstate": async () => listenTogetherCompat.getDebugState(),
     "audioplayer.play": async () => false,
     "audioplayer.load": async () => false,
     "audioplayer.pause": async () => true,

@@ -66,8 +66,11 @@ function buildPublicApiFallbackRequest(url, rpcBody) {
   const payloadObject = rpcBody && rpcBody.payloadObject && typeof rpcBody.payloadObject === "object"
     ? { ...rpcBody.payloadObject }
     : {};
-  delete payloadObject.header;
-  delete payloadObject.e_r;
+  const shouldKeepRpcEnvelope = apiPath.startsWith("/api/listen/together/");
+  if (!shouldKeepRpcEnvelope) {
+    delete payloadObject.header;
+    delete payloadObject.e_r;
+  }
 
   const requestBody = new URLSearchParams();
   for (const [key, value] of Object.entries(payloadObject)) {

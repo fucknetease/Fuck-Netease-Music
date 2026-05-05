@@ -57,6 +57,66 @@ function normalizeBridgeValue(value) {
   return value;
 }
 
+function shouldTraceBridgeName(name) {
+  const normalizedName = String(name || "").toLowerCase();
+  if (!normalizedName) {
+    return false;
+  }
+
+  return [
+    "im.",
+    "rtc.",
+    "nimsys.",
+    "listen",
+    "together",
+    "chatroom",
+    "chat_room",
+    "invite",
+    "room",
+    "token",
+    "credential",
+    "agora",
+    "yunxin",
+    "nim"
+  ].some((fragment) => normalizedName.includes(fragment));
+}
+
+function summarizeBridgeValue(value, depth = 0) {
+  if (depth >= 3) {
+    return "[depth-limit]";
+  }
+
+  if (typeof value === "string") {
+    return value.length > 240 ? `${value.slice(0, 240)}...[trimmed:${value.length}]` : value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => summarizeBridgeValue(item, depth + 1));
+  }
+
+  if (value && typeof value === "object") {
+    const output = {};
+    for (const [key, entry] of Object.entries(value).slice(0, 20)) {
+      output[key] = summarizeBridgeValue(entry, depth + 1);
+    }
+    return output;
+  }
+
+  return value;
+}
+
+function traceBridge(stage, name, payload) {
+  if (!shouldTraceBridgeName(name)) {
+    return;
+  }
+
+  reportRendererInfo("bridge-trace", {
+    stage,
+    name: String(name || ""),
+    payload: summarizeBridgeValue(payload)
+  });
+}
+
 function installClipboardBridge() {
   const readSelectionText = () => {
     const activeElement = document.activeElement;
@@ -293,11 +353,32 @@ function unwrapCallbackResult(result) {
 
 const bridge = {
   call(name, ...args) {
+    traceBridge("bridge.call:start", name, args);
     const localInvocation = invokeLocalBridge(name, args);
     if (localInvocation.handled) {
-      return Promise.resolve(localInvocation.result).then((result) => unwrapCallbackResult(result));
+      return Promise.resolve(localInvocation.result).then((result) => {
+        const unwrapped = unwrapCallbackResult(result);
+        traceBridge("bridge.call:local:ok", name, unwrapped);
+        return unwrapped;
+      }).catch((error) => {
+        traceBridge("bridge.call:local:error", name, {
+          message: error?.message || String(error),
+          stack: error?.stack || null
+        });
+        throw error;
+      });
     }
-    return invokeNative(name, args).then((result) => unwrapCallbackResult(result));
+    return invokeNative(name, args).then((result) => {
+      const unwrapped = unwrapCallbackResult(result);
+      traceBridge("bridge.call:native:ok", name, unwrapped);
+      return unwrapped;
+    }).catch((error) => {
+      traceBridge("bridge.call:native:error", name, {
+        message: error?.message || String(error),
+        stack: error?.stack || null
+      });
+      throw error;
+    });
   },
   fillRegisterCallIfEmpty,
   overwriteRegisterCall,
@@ -307,9 +388,11 @@ const bridge = {
 
 channel.call = (name, callback, argsLike) => {
   const args = Array.isArray(argsLike) ? argsLike : Array.from(argsLike || []);
+  traceBridge("channel.call:start", name, args);
   const localInvocation = invokeLocalBridge(name, args);
 
   const handleSuccess = (result) => {
+    traceBridge("channel.call:ok", name, result);
     if (typeof callback !== "function") {
       return;
     }
@@ -326,6 +409,11 @@ channel.call = (name, callback, argsLike) => {
 
   const handleFailure = (error, scope) => {
     console.error(scope, name, error);
+    traceBridge("channel.call:error", name, {
+      scope,
+      message: error?.message || String(error),
+      stack: error?.stack || null
+    });
     if (typeof callback === "function") {
       callback(null);
     }
@@ -343,7 +431,12 @@ channel.call = (name, callback, argsLike) => {
     .catch((error) => handleFailure(error, "[channel.call]"));
 };
 
-channel.registerCall = registerChannelCall;
+channel.registerCall = (name, callback) => {
+  traceBridge("channel.register", name, {
+    hasCallback: typeof callback === "function"
+  });
+  return registerChannelCall(name, callback);
+};
 channel.registerCall.__HACKED__ = true;
 
 window.channel = channel;
