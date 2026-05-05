@@ -438,7 +438,8 @@ function createLocalAudioBridge(options) {
     safeParseJson,
     runRegisteredCallbacks,
     reportRendererError,
-    invokeNative
+    invokeNative,
+    resolveAppStore = () => null
   } = options;
 
   function readPlayableUrl(payload = {}) {
@@ -500,12 +501,238 @@ function createLocalAudioBridge(options) {
   let lastPlaybackRate = 1;
   let pendingSeekSeconds = null;
   const preparedPlayableSourceCache = new Map();
+  const mediaSessionState = {
+    info: null,
+    lyrics: null,
+    totalTime: 0,
+    offset: 0,
+    playbackState: "none"
+  };
 
   const PLAY_STATE = {
     play: 0,
     pause: 1,
     stop: 2
   };
+
+  const canUseMediaSession =
+    typeof navigator !== "undefined" &&
+    navigator.mediaSession &&
+    typeof window !== "undefined";
+
+  const normalizePlayerPayload = (args = []) => {
+    if (args.length === 1) {
+      return args[0] && typeof args[0] === "object" ? args[0] : null;
+    }
+    if (args.length > 1) {
+      const [first] = args;
+      return first && typeof first === "object" ? first : null;
+    }
+    return null;
+  };
+
+  const normalizeLyricsPayload = (args = []) => {
+    if (args.length === 1) {
+      return args[0];
+    }
+    return args;
+  };
+
+  const readLyricsText = (value) => {
+    if (!value) {
+      return "";
+    }
+    if (typeof value === "string") {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => readLyricsText(entry)).filter(Boolean).join(" ");
+    }
+    if (typeof value === "object") {
+      return (
+        value.currentLine ||
+        value.currentLyric ||
+        value.line ||
+        value.lyric ||
+        value.lrc ||
+        value.text ||
+        value.content ||
+        ""
+      );
+    }
+    return "";
+  };
+
+  const buildArtworkList = (coverUrl = "") => {
+    const source = normalizePlayableUrl(String(coverUrl || ""));
+    if (!source) {
+      return [];
+    }
+    return [
+      { src: source, sizes: "512x512", type: "image/png" },
+      { src: source, sizes: "256x256", type: "image/png" },
+      { src: source, sizes: "128x128", type: "image/png" }
+    ];
+  };
+
+  const readArtistText = (info = {}) => {
+    if (typeof info.artistName === "string" && info.artistName) {
+      return info.artistName;
+    }
+    if (Array.isArray(info.artists)) {
+      return info.artists
+        .map((artist) => {
+          if (typeof artist === "string") {
+            return artist;
+          }
+          return artist?.name || "";
+        })
+        .filter(Boolean)
+        .join("/");
+    }
+    return "";
+  };
+
+  const updateMediaSessionPositionState = () => {
+    if (!canUseMediaSession || typeof navigator.mediaSession.setPositionState !== "function") {
+      return;
+    }
+    const audio = audioElement;
+    const duration = Number(
+      audio && Number.isFinite(audio.duration) && audio.duration > 0
+        ? audio.duration
+        : mediaSessionState.totalTime
+    );
+    const position = Number(
+      audio && Number.isFinite(audio.currentTime) && audio.currentTime >= 0
+        ? audio.currentTime
+        : mediaSessionState.offset
+    );
+    if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position) || position < 0) {
+      return;
+    }
+    try {
+      navigator.mediaSession.setPositionState({
+        duration,
+        playbackRate: lastPlaybackRate > 0 ? lastPlaybackRate : 1,
+        position: Math.min(position, duration)
+      });
+    } catch {}
+  };
+
+  const updateMediaSessionMetadata = () => {
+    if (!canUseMediaSession || typeof MediaMetadata !== "function") {
+      return;
+    }
+    const info = mediaSessionState.info || {};
+    const lyricsText = readLyricsText(mediaSessionState.lyrics);
+    const albumName =
+      [info.albumName || "", lyricsText].filter(Boolean).join(" | ") ||
+      info.albumName ||
+      "";
+
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: info.songName || info.title || document.title || "NetEase Cloud Music",
+        artist: readArtistText(info),
+        album: albumName,
+        artwork: buildArtworkList(info.url || info.cover || info.coverUrl || info.picUrl || "")
+      });
+    } catch (error) {
+      reportRendererError("media-session-metadata-failed", {
+        message: error?.message || String(error)
+      });
+    }
+    updateMediaSessionPositionState();
+  };
+
+  const setMediaSessionPlaybackState = (value) => {
+    mediaSessionState.playbackState = value;
+    if (!canUseMediaSession) {
+      return;
+    }
+    try {
+      navigator.mediaSession.playbackState = value;
+    } catch {}
+    updateMediaSessionPositionState();
+  };
+
+  const dispatchStoreAction = (action) => {
+    const store = resolveAppStore();
+    if (!store || typeof store.dispatch !== "function") {
+      return false;
+    }
+    try {
+      store.dispatch(action);
+      return true;
+    } catch (error) {
+      reportRendererError("media-session-dispatch-failed", {
+        message: error?.message || String(error),
+        action
+      });
+      return false;
+    }
+  };
+
+  const installMediaSessionActionHandlers = () => {
+    if (!canUseMediaSession || typeof navigator.mediaSession.setActionHandler !== "function") {
+      return;
+    }
+    const wrapHandler = (name, handler) => {
+      try {
+        navigator.mediaSession.setActionHandler(name, handler);
+      } catch {}
+    };
+    wrapHandler("play", async () => {
+      if (!dispatchStoreAction({ type: "playing/switchResumeOrPause", payload: { triggerScene: "native" } })) {
+        await ensureAudioElement().play().catch(() => {});
+      }
+    });
+    wrapHandler("pause", () => {
+      if (!dispatchStoreAction({ type: "playing/switchResumeOrPause", payload: { triggerScene: "native" } })) {
+        ensureAudioElement().pause();
+      }
+    });
+    wrapHandler("previoustrack", () => {
+      dispatchStoreAction({
+        type: "playing/jump2Track",
+        payload: { flag: -1, type: "call", triggerScene: "native" }
+      });
+    });
+    wrapHandler("nexttrack", () => {
+      dispatchStoreAction({
+        type: "playing/jump2Track",
+        payload: { flag: 1, type: "call", triggerScene: "native" }
+      });
+    });
+    wrapHandler("seekto", (details = {}) => {
+      const audio = ensureAudioElement();
+      const nextTime = Number(details.seekTime ?? 0);
+      if (!Number.isFinite(nextTime) || nextTime < 0) {
+        return;
+      }
+      audio.currentTime = nextTime;
+      mediaSessionState.offset = nextTime;
+      updateMediaSessionPositionState();
+    });
+    wrapHandler("seekbackward", (details = {}) => {
+      const audio = ensureAudioElement();
+      const offset = Number(details.seekOffset ?? 10);
+      audio.currentTime = Math.max(0, (audio.currentTime || 0) - offset);
+      mediaSessionState.offset = audio.currentTime || 0;
+      updateMediaSessionPositionState();
+    });
+    wrapHandler("seekforward", (details = {}) => {
+      const audio = ensureAudioElement();
+      const offset = Number(details.seekOffset ?? 10);
+      const duration = Number.isFinite(audio.duration) ? audio.duration : Number.POSITIVE_INFINITY;
+      audio.currentTime = Math.min(duration, (audio.currentTime || 0) + offset);
+      mediaSessionState.offset = audio.currentTime || 0;
+      updateMediaSessionPositionState();
+    });
+  };
+
+  installMediaSessionActionHandlers();
 
   const ensureAudioElement = () => {
     if (audioElement) {
@@ -591,6 +818,7 @@ function createLocalAudioBridge(options) {
 
     audioElement.addEventListener("loadedmetadata", () => {
       applyPendingSeek();
+      mediaSessionState.totalTime = audioElement?.duration || mediaSessionState.totalTime || 0;
       runRegisteredCallbacks("audioplayer.onLoad", [
         currentPlayId,
         {
@@ -598,6 +826,7 @@ function createLocalAudioBridge(options) {
           duration: audioElement?.duration || 0
         }
       ]);
+      updateMediaSessionPositionState();
       emitPlayProgress(true);
     });
 
@@ -615,6 +844,7 @@ function createLocalAudioBridge(options) {
 
     audioElement.addEventListener("play", () => {
       startProgressTimer();
+      setMediaSessionPlaybackState("playing");
       runRegisteredCallbacks("audioplayer.onBuffering", [currentPlayId, false]);
       runRegisteredCallbacks("audioplayer.onPlayState", [
         currentPlayId,
@@ -626,6 +856,7 @@ function createLocalAudioBridge(options) {
     audioElement.addEventListener("pause", () => {
       stopProgressTimer();
       const ended = Boolean(audioElement?.ended);
+      setMediaSessionPlaybackState(ended ? "none" : "paused");
       runRegisteredCallbacks("audioplayer.onPlayState", [
         currentPlayId,
         currentResumeOrPauseId,
@@ -635,6 +866,7 @@ function createLocalAudioBridge(options) {
 
     audioElement.addEventListener("ended", () => {
       stopProgressTimer();
+      setMediaSessionPlaybackState("none");
       emitPlayProgress(true);
       runRegisteredCallbacks("audioplayer.onEnd", [
         currentPlayId,
@@ -666,10 +898,14 @@ function createLocalAudioBridge(options) {
     });
 
     audioElement.addEventListener("timeupdate", () => {
+      mediaSessionState.offset = audioElement?.currentTime || 0;
+      updateMediaSessionPositionState();
       emitPlayProgress(false);
     });
 
     audioElement.addEventListener("seeked", () => {
+      mediaSessionState.offset = audioElement?.currentTime || 0;
+      updateMediaSessionPositionState();
       runRegisteredCallbacks("audioplayer.onSeek", [
         currentPlayId,
         currentSeekId,
@@ -755,6 +991,7 @@ function createLocalAudioBridge(options) {
       audio.defaultPlaybackRate = lastPlaybackRate;
       audio.currentTime = 0;
       audio.load();
+      updateMediaSessionPositionState();
       return true;
     },
     "audioplayer.play": async (playId, resumeOrPauseId = "") => {
@@ -787,6 +1024,8 @@ function createLocalAudioBridge(options) {
       currentPlayId = String(playId || currentPlayId || "");
       audio.pause();
       audio.currentTime = 0;
+      mediaSessionState.offset = 0;
+      setMediaSessionPlaybackState("none");
       runRegisteredCallbacks("audioplayer.onPlayState", [currentPlayId, "", PLAY_STATE.stop]);
       runRegisteredCallbacks("audioplayer.onEnd", [currentPlayId, { code: 0, stopped: true }]);
       return true;
@@ -809,6 +1048,40 @@ function createLocalAudioBridge(options) {
         nextTimeSeconds,
         audio.duration > 0 ? audio.duration : nextTimeSeconds
       );
+      mediaSessionState.offset = audio.currentTime || 0;
+      updateMediaSessionPositionState();
+      return true;
+    },
+    "player.setsmtcenable": async () => true,
+    "player.setminiplayerstate": async (payload = {}) => {
+      const normalized = payload && typeof payload === "object" ? payload : {};
+      if (normalized.playstate === PLAY_STATE.play || normalized.playstate === 0) {
+        setMediaSessionPlaybackState("playing");
+      } else if (normalized.playstate === PLAY_STATE.pause || normalized.playstate === 1) {
+        setMediaSessionPlaybackState("paused");
+      } else if (normalized.playstate === PLAY_STATE.stop || normalized.playstate === 2) {
+        setMediaSessionPlaybackState("none");
+      }
+      return true;
+    },
+    "player.setinfo": async (...args) => {
+      mediaSessionState.info = normalizePlayerPayload(args);
+      updateMediaSessionMetadata();
+      return true;
+    },
+    "player.settotaltime": async (value = 0) => {
+      mediaSessionState.totalTime = Number(value || 0);
+      updateMediaSessionPositionState();
+      return true;
+    },
+    "player.setlyrics": async (...args) => {
+      mediaSessionState.lyrics = normalizeLyricsPayload(args);
+      updateMediaSessionMetadata();
+      return true;
+    },
+    "player.setoffset": async (value = 0) => {
+      mediaSessionState.offset = Number(value || 0);
+      updateMediaSessionPositionState();
       return true;
     },
     "audioplayer.preload": async (_playId, payload = {}) => {

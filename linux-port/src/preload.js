@@ -314,7 +314,8 @@ const localAudioBridge = createLocalAudioBridge({
   safeParseJson,
   runRegisteredCallbacks,
   reportRendererError,
-  invokeNative
+  invokeNative,
+  resolveAppStore: runtimePatches.resolveAppStore
 });
 
 const localPopupMenuBridge = createLocalPopupMenuBridge({
