@@ -179,9 +179,14 @@ function createWindowManager(options) {
     mainWindow.on("leave-full-screen", () => {
       nativeApiRef()?.emitNativeEvent("winhelper.onFullscreenChange", false);
     });
-    mainWindow.on("close", () => {
-      nativeApiRef()?.emitNativeEvent("winhelper.onSystemRequestCloseWindow");
-      nativeApiRef()?.emitNativeEvent("winhelper.onClose");
+    mainWindow.on("close", (event) => {
+      const nativeApi = nativeApiRef();
+      if (nativeApi?.shouldHideOnClose?.()) {
+        event.preventDefault();
+        mainWindow.hide();
+      }
+      nativeApi?.emitNativeEvent("winhelper.onSystemRequestCloseWindow");
+      nativeApi?.emitNativeEvent("winhelper.onClose");
     });
     mainWindow.on("closed", () => {
       mainWindow = null;

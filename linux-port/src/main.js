@@ -481,6 +481,7 @@ app.whenReady().then(async () => {
     mainWindowRef: () => windowManager.getMainWindow(),
     assetRoot,
     appVersion,
+    appIconPath,
     createWindow: windowManager.createAuxiliaryWindow,
     extractedRoot,
     logger: console

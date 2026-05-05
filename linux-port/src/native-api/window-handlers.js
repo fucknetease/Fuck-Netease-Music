@@ -67,6 +67,19 @@ function createWindowHandlers(options) {
       }
       return true;
     },
+    "winhelper.showwindow": async (state) => {
+      const win = currentWindow();
+      if (!win || win.isDestroyed()) {
+        return true;
+      }
+      if (state === "hide" || state === false) {
+        win.hide();
+        return true;
+      }
+      win.show();
+      win.focus();
+      return true;
+    },
     "winhelper.hide": async () => {
       const win = currentWindow();
       if (win && !win.isDestroyed()) {

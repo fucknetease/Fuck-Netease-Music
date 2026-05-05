@@ -6,7 +6,19 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { screen, shell, nativeTheme, dialog, session, globalShortcut, Menu, clipboard } = require("electron");
+const {
+  screen,
+  shell,
+  nativeTheme,
+  dialog,
+  session,
+  globalShortcut,
+  Menu,
+  clipboard,
+  Tray,
+  nativeImage,
+  Notification
+} = require("electron");
 const { createDownloadManager } = require("./native-api/download-manager");
 const { createListenTogetherCompat } = require("./native-api/listen-together");
 const { createNetworkHandlers } = require("./native-api/network");
@@ -501,7 +513,8 @@ function createNativeApi(options) {
     assetRoot,
     extractedRoot,
     createWindow = null,
-    appVersion = "3.1.32.205206"
+    appVersion = "3.1.32.205206",
+    appIconPath = ""
   } = options;
 
   const userDataRoot = app.getPath("userData");
@@ -535,6 +548,12 @@ function createNativeApi(options) {
   let invocationWindow = null;
   let persistedHostCache = null;
   let persistentModelTableColumnsCache = null;
+  let appQuitRequested = false;
+  const trayState = {
+    instance: null,
+    iconPath: "",
+    tooltip: "网易云音乐"
+  };
   const playerRuntimeState = {
     info: null,
     lyrics: null,
@@ -1099,6 +1118,24 @@ function createNativeApi(options) {
     }, 0);
   }
 
+  function resolveCloseFrameType() {
+    const settingValue =
+      typeof settings.closeFrameType === "string" && settings.closeFrameType
+        ? settings.closeFrameType
+        : null;
+    const localConfigValue =
+      typeof localConfig?.setting?.closeFrameType === "string" && localConfig.setting.closeFrameType
+        ? localConfig.setting.closeFrameType
+        : typeof localConfig?.closeFrameType === "string" && localConfig.closeFrameType
+          ? localConfig.closeFrameType
+          : null;
+    return settingValue || localConfigValue || "tray";
+  }
+
+  function shouldHideOnClose() {
+    return !appQuitRequested && resolveCloseFrameType() !== "exit" && Boolean(trayState.instance);
+  }
+
   function resolveOrpheusPath(inputPath) {
     const rawPath = String(inputPath || "");
     if (!rawPath) {
@@ -1129,6 +1166,95 @@ function createNativeApi(options) {
     }
 
     return path.join(storageRoot, withoutLeading);
+  }
+
+  function resolveTrayIconPath(inputPath = "") {
+    const resolvedPath = resolveOrpheusPath(inputPath);
+    const preferPngFallback =
+      process.platform === "linux" &&
+      appIconPath &&
+      fs.existsSync(appIconPath) &&
+      /\.ico$/i.test(String(resolvedPath || inputPath || ""));
+    if (preferPngFallback) {
+      return appIconPath;
+    }
+    if (resolvedPath && fs.existsSync(resolvedPath)) {
+      return resolvedPath;
+    }
+    if (appIconPath && fs.existsSync(appIconPath)) {
+      return appIconPath;
+    }
+    const extractedTrayIconPath = path.join(
+      assetRoot,
+      "public",
+      "assets",
+      "img",
+      "common",
+      "tray",
+      "app.ico"
+    );
+    if (fs.existsSync(extractedTrayIconPath)) {
+      return extractedTrayIconPath;
+    }
+    return "";
+  }
+
+  function createTrayImage(iconPath = "") {
+    const resolvedPath = resolveTrayIconPath(iconPath);
+    if (!resolvedPath) {
+      return null;
+    }
+    const image = nativeImage.createFromPath(resolvedPath);
+    if (!image || image.isEmpty()) {
+      return resolvedPath;
+    }
+    return image;
+  }
+
+  function ensureTrayIconInstalled() {
+    const trayImage = createTrayImage(trayState.iconPath);
+    if (!trayImage || typeof Tray !== "function") {
+      return false;
+    }
+
+    if (!trayState.instance || trayState.instance.isDestroyed?.()) {
+      try {
+        trayState.instance = new Tray(trayImage);
+      } catch (error) {
+        logger.warn(
+          "[native:tray:create-failed]",
+          JSON.stringify({
+            iconPath: trayState.iconPath,
+            resolvedIconPath: resolveTrayIconPath(trayState.iconPath),
+            message: error?.message || String(error)
+          })
+        );
+        return false;
+      }
+      trayState.instance.on("click", () => {
+        emitNativeEventSoon("trayicon.onClick");
+      });
+      trayState.instance.on("right-click", () => {
+        emitNativeEventSoon("trayicon.onRightclick");
+      });
+      trayState.instance.on("double-click", () => {
+        emitNativeEventSoon("trayicon.onClick");
+      });
+    } else if (typeof trayState.instance.setImage === "function") {
+      trayState.instance.setImage(trayImage);
+    }
+
+    if (trayState.tooltip && typeof trayState.instance.setToolTip === "function") {
+      trayState.instance.setToolTip(trayState.tooltip);
+    }
+    return true;
+  }
+
+  function destroyTrayIcon() {
+    if (trayState.instance && typeof trayState.instance.destroy === "function") {
+      trayState.instance.destroy();
+    }
+    trayState.instance = null;
   }
 
   async function executeSqlite(sqlText) {
@@ -1335,7 +1461,11 @@ function createNativeApi(options) {
 
   async function showPopupMenu(rawPayload = {}) {
     const win = currentWindow();
-    if (!win || win.isDestroyed() || typeof Menu?.buildFromTemplate !== "function") {
+    if ((!win || win.isDestroyed()) && typeof Menu?.buildFromTemplate !== "function") {
+      logger.log("[native:popupmenu:skip]", JSON.stringify({ reason: "window-unavailable" }));
+      return callbackArgs(null);
+    }
+    if (typeof Menu?.buildFromTemplate !== "function") {
       logger.log("[native:popupmenu:skip]", JSON.stringify({ reason: "window-unavailable" }));
       return callbackArgs(null);
     }
@@ -1372,7 +1502,7 @@ function createNativeApi(options) {
 
     await new Promise((resolve) => {
       menu.popup({
-        window: win,
+        window: win && !win.isDestroyed() && win.isVisible() ? win : undefined,
         x,
         y,
         callback: () => resolve()
@@ -1982,6 +2112,7 @@ function createNativeApi(options) {
     "app.report2bi": async () => true,
     "app.setthumbnail": async () => true,
     "app.exit": async () => {
+      appQuitRequested = true;
       app.quit();
       return true;
     },
@@ -2574,14 +2705,43 @@ function createNativeApi(options) {
     "desktop.show": async () => false,
     "desktop.load": async () => false,
     "desktop.destroy": async () => true,
-    "trayicon.install": async () => false,
-    "trayicon.uninstall": async () => true,
-    "trayicon.seticon": async () => false,
-    "trayicon.settooltip": async () => true,
-    "trayicon.wasinstall": async () => false,
-    "trayicon.popballoon": async () => false,
-    "trayicon.geticon": async () => null,
-    "trayicon.gettooltip": async () => "",
+    "trayicon.install": async () => ensureTrayIconInstalled(),
+    "trayicon.uninstall": async () => {
+      destroyTrayIcon();
+      return true;
+    },
+    "trayicon.seticon": async (iconPath = "") => {
+      trayState.iconPath = String(iconPath || "");
+      ensureTrayIconInstalled();
+      return trayState.tooltip || "网易云音乐";
+    },
+    "trayicon.settooltip": async (tooltip = "") => {
+      trayState.tooltip = String(tooltip || "网易云音乐");
+      if (trayState.instance && typeof trayState.instance.setToolTip === "function") {
+        trayState.instance.setToolTip(trayState.tooltip);
+      }
+      return true;
+    },
+    "trayicon.wasinstall": async () => Boolean(trayState.instance),
+    "trayicon.popballoon": async (payload = {}) => {
+      if (!Notification?.isSupported?.()) {
+        return false;
+      }
+      const title =
+        payload.title || payload.caption || payload.head || payload.name || "网易云音乐";
+      const body =
+        payload.content || payload.text || payload.msg || payload.message || "";
+      if (!title && !body) {
+        return false;
+      }
+      new Notification({
+        title: String(title || "网易云音乐"),
+        body: String(body || "")
+      }).show();
+      return true;
+    },
+    "trayicon.geticon": async () => trayState.iconPath || null,
+    "trayicon.gettooltip": async () => trayState.tooltip || "",
     "network.init": async () => ({
       supportRPC: true,
       maxFailCount: 100,
@@ -2815,6 +2975,10 @@ function createNativeApi(options) {
     initialize: sessionRuntime.initialize,
     invoke,
     emitNativeEvent,
+    markAppQuitRequested() {
+      appQuitRequested = true;
+    },
+    shouldHideOnClose,
     resolveOrpheusPath,
     storageRoot
   };
