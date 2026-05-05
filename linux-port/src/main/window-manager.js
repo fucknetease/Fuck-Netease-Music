@@ -6,6 +6,7 @@ function createWindowManager(options) {
   const {
     ORPHEUS_SCHEME,
     sharedWebPreferences,
+    appIconPath,
     appTitle = "NetEase Cloud Music Linux Port",
     appBackgroundColor = "#1a1d21",
     auxiliaryBackgroundColor = "#1a1d21",
@@ -56,6 +57,7 @@ function createWindowManager(options) {
             height: 720,
             minWidth: 360,
             minHeight: 320,
+            icon: appIconPath,
             autoHideMenuBar: true,
             backgroundColor: auxiliaryBackgroundColor,
             parent: win,
@@ -134,6 +136,7 @@ function createWindowManager(options) {
       maximizable: windowOptions.resizable !== false,
       skipTaskbar: windowOptions.taskbarButton === false,
       autoHideMenuBar: true,
+      icon: appIconPath,
       backgroundColor: windowOptions.bk_color || auxiliaryBackgroundColor,
       parent: parentWindow && !parentWindow.isDestroyed() ? parentWindow : mainWindow,
       modal: Boolean(windowOptions.spec_window),
@@ -160,6 +163,7 @@ function createWindowManager(options) {
       minHeight: 640,
       show: false,
       autoHideMenuBar: true,
+      icon: appIconPath,
       title: appTitle,
       backgroundColor: appBackgroundColor,
       webPreferences: {

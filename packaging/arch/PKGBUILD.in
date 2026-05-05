@@ -12,9 +12,10 @@ source=(
   'fuck-netease-music.AppImage'
   'fuck-netease-music.sh'
   'fuck-netease-music.desktop'
+  'fuck-netease-music.png'
 )
 noextract=('fuck-netease-music.AppImage')
-sha256sums=('SKIP' 'SKIP' 'SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 package() {
   install -Dm755 "${srcdir}/fuck-netease-music.AppImage" \
@@ -23,4 +24,6 @@ package() {
     "${pkgdir}/usr/bin/fuck-netease-music"
   install -Dm644 "${srcdir}/fuck-netease-music.desktop" \
     "${pkgdir}/usr/share/applications/fuck-netease-music.desktop"
+  install -Dm644 "${srcdir}/fuck-netease-music.png" \
+    "${pkgdir}/usr/share/pixmaps/fuck-netease-music.png"
 }

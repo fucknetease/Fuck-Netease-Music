@@ -33,6 +33,7 @@ const linuxPortRoot = path.resolve(__dirname, "..");
 const assetRoot = process.env.NETEASE_ASSET_ROOT
   ? path.resolve(process.env.NETEASE_ASSET_ROOT)
   : path.join(projectRoot, "extracted", "orpheus_pkg", "pub");
+const appIconPath = path.join(linuxPortRoot, "build", "icon.png");
 const extractedRoot = path.join(projectRoot, "extracted");
 const debugRoot = path.join(linuxPortRoot, "debug");
 const sharedWebPreferences = {
@@ -467,6 +468,7 @@ const appVersion = detectAppVersion();
 const windowManager = createWindowManager({
   ORPHEUS_SCHEME,
   sharedWebPreferences,
+  appIconPath,
   revealMainWindow,
   injectRendererCompatibilityBootstrap,
   runBootDiagnostics: (mainWindow) => runBootDiagnostics(mainWindow, debugRoot),

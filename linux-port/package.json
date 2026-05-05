@@ -27,6 +27,7 @@
       "buildResources": "build"
     },
     "files": [
+      "build/**/*",
       "src/**/*",
       "scripts/**/*",
       "package.json"
@@ -45,6 +46,7 @@
       "target": [
         "AppImage"
       ],
+      "icon": "build/icon.png",
       "category": "AudioVideo",
       "executableName": "fuck-netease-music",
       "maintainer": "fucknetease <sh1tnetease@outlook.com>"
