@@ -48,6 +48,25 @@ function createWindowManager(options) {
   }
 
   function wireExternalNavigation(win) {
+    const openExternalUrl = (targetUrl) => {
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(String(targetUrl || ""));
+      } catch {
+        console.warn("[external:navigate:invalid-url]", targetUrl);
+        return;
+      }
+
+      if (!["http:", "https:", "mailto:"].includes(parsedUrl.protocol)) {
+        console.warn("[external:navigate:blocked-protocol]", parsedUrl.protocol, targetUrl);
+        return;
+      }
+
+      void shell.openExternal(parsedUrl.toString()).catch((error) => {
+        console.error("[external:navigate:failed]", parsedUrl.toString(), error);
+      });
+    };
+
     win.webContents.setWindowOpenHandler(({ url, features }) => {
       if (url.startsWith(`${ORPHEUS_SCHEME}://`)) {
         return {
@@ -71,14 +90,14 @@ function createWindowManager(options) {
         };
       }
 
-      shell.openExternal(url);
+      openExternalUrl(url);
       return { action: "deny" };
     });
 
     win.webContents.on("will-navigate", (event, url) => {
       if (!url.startsWith(`${ORPHEUS_SCHEME}://`)) {
         event.preventDefault();
-        shell.openExternal(url);
+        openExternalUrl(url);
       }
     });
   }

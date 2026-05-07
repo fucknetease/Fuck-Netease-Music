@@ -18,6 +18,26 @@ function createWindowHandlers(options) {
     createWindow
   } = options;
 
+  function coerceWindowTitle(payload) {
+    if (typeof payload === "string" && payload) {
+      return payload;
+    }
+    if (payload && typeof payload === "object" && typeof payload.title === "string" && payload.title) {
+      return payload.title;
+    }
+    return "NetEase Cloud Music";
+  }
+
+  function resolveMinimumSizeValue(...candidates) {
+    for (const candidate of candidates) {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return Math.round(parsed);
+      }
+    }
+    return null;
+  }
+
   return {
     "app.opensavefiledialog": async (payload = {}) => {
       const win = currentWindow();
@@ -143,7 +163,11 @@ function createWindowHandlers(options) {
     "winhelper.setwindowsizelimit": async (payload = {}) => {
       const win = currentWindow();
       if (win && !win.isDestroyed()) {
-        win.setMinimumSize(payload.x || 480, payload.y || 320);
+        const minWidth =
+          resolveMinimumSizeValue(payload.minWidth, payload.width, payload.x) || 480;
+        const minHeight =
+          resolveMinimumSizeValue(payload.minHeight, payload.height, payload.y) || 320;
+        win.setMinimumSize(minWidth, minHeight);
       }
       return true;
     },
@@ -161,7 +185,7 @@ function createWindowHandlers(options) {
     "winhelper.setwindowtitle": async (payload = {}) => {
       const win = currentWindow();
       if (win && !win.isDestroyed()) {
-        win.setTitle(payload.title || payload || "NetEase Cloud Music");
+        win.setTitle(coerceWindowTitle(payload));
       }
       return true;
     },
