@@ -375,13 +375,14 @@ jobs:
           cp packaging/aur/.SRCINFO aur-repo/.SRCINFO
           cp packaging/aur/fuck-netease-music.sh aur-repo/fuck-netease-music.sh
           cp packaging/aur/fuck-netease-music.desktop aur-repo/fuck-netease-music.desktop
+          cp packaging/aur/fuck-netease-music.png aur-repo/fuck-netease-music.png
 
       - name: Commit and push to AUR
         run: |
           cd aur-repo
           git config user.name "fucknetease"
           git config user.email "sh1tnetease@outlook.com"
-          git add PKGBUILD .SRCINFO fuck-netease-music.sh fuck-netease-music.desktop
+          git add PKGBUILD .SRCINFO fuck-netease-music.sh fuck-netease-music.desktop fuck-netease-music.png
           git diff --cached --quiet && exit 0
           git commit -m "update to ${{ steps.aurmeta.outputs.pkgver }}"
           git push
