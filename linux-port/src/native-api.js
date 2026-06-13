@@ -4,8 +4,10 @@ const crypto = require("node:crypto");
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const { Readable } = require("node:stream");
 const {
   screen,
   shell,
@@ -555,6 +557,13 @@ function createNativeApi(options) {
     iconPath: "",
     tooltip: "网易云音乐"
   };
+  const audioProxyState = {
+    server: null,
+    port: 0,
+    pendingStart: null,
+    routeByToken: new Map()
+  };
+  const playerUrlResponseCache = new Map();
   const playerRuntimeState = {
     info: null,
     lyrics: null,
@@ -1137,7 +1146,13 @@ function createNativeApi(options) {
   }
 
   function shouldHideOnClose() {
-    return !appQuitRequested && resolveCloseFrameType() !== "exit" && Boolean(trayState.instance);
+    if (appQuitRequested || resolveCloseFrameType() === "exit") {
+      return false;
+    }
+    if (trayState.instance) {
+      return true;
+    }
+    return ensureTrayIconInstalled();
   }
 
   function resolveOrpheusPath(inputPath) {
@@ -1192,6 +1207,14 @@ function createNativeApi(options) {
     if (appIconPath && fs.existsSync(appIconPath)) {
       return appIconPath;
     }
+    const extractedPngTrayIconPath = path.join(
+      process.resourcesPath || "",
+      "build",
+      "icon.png"
+    );
+    if (extractedPngTrayIconPath && fs.existsSync(extractedPngTrayIconPath)) {
+      return extractedPngTrayIconPath;
+    }
     const extractedTrayIconPath = path.join(
       assetRoot,
       "public",
@@ -1244,6 +1267,7 @@ function createNativeApi(options) {
       });
       trayState.instance.on("right-click", () => {
         emitNativeEventSoon("trayicon.onRightclick");
+        void showTrayContextMenu();
       });
       trayState.instance.on("double-click", () => {
         emitNativeEventSoon("trayicon.onClick");
@@ -1253,7 +1277,7 @@ function createNativeApi(options) {
     }
 
     if (trayState.tooltip && typeof trayState.instance.setToolTip === "function") {
-      trayState.instance.setToolTip(trayState.tooltip);
+      trayState.instance.setToolTip(getTrayTooltipText());
     }
     return true;
   }
@@ -1263,6 +1287,428 @@ function createNativeApi(options) {
       trayState.instance.destroy();
     }
     trayState.instance = null;
+  }
+
+  function resolvePlayerInfoObject() {
+    const infoArgs = Array.isArray(playerRuntimeState.info) ? playerRuntimeState.info : [];
+    if (infoArgs[0] && typeof infoArgs[0] === "object") {
+      return infoArgs[0];
+    }
+    return {};
+  }
+
+  function getTrayTooltipText() {
+    const info = resolvePlayerInfoObject();
+    const songName = String(info.songName || info.title || "").trim();
+    const artistName = String(info.artistName || "").trim();
+    if (songName && artistName) {
+      return `${songName} - ${artistName}`;
+    }
+    if (songName) {
+      return songName;
+    }
+    return trayState.tooltip || "网易云音乐";
+  }
+
+  async function showMainWindowFromTray() {
+    const window = mainWindowRef();
+    if (!window || window.isDestroyed()) {
+      return;
+    }
+    window.show();
+    window.focus();
+  }
+
+  function isPlayerPlaying() {
+    const state = playerRuntimeState.miniPlayerState;
+    const playState = Number(
+      state?.playstate ??
+        state?.playState ??
+        state?.state ??
+        state?.status ??
+        NaN
+    );
+    return playState === 0;
+  }
+
+  async function dispatchRendererPlayerAction(action) {
+    const window = mainWindowRef();
+    if (!window || window.isDestroyed()) {
+      return false;
+    }
+
+    const payload = JSON.stringify(action);
+    const script = `(() => {
+      const readStoreFromCandidate = (candidate) => {
+        if (!candidate || typeof candidate !== "object") {
+          return null;
+        }
+        const possibleStores = [
+          candidate,
+          candidate._store,
+          candidate.store,
+          candidate.app?._store,
+          candidate.app?.store
+        ];
+        for (const store of possibleStores) {
+          if (store && typeof store.getState === "function" && typeof store.dispatch === "function") {
+            return store;
+          }
+        }
+        return null;
+      };
+      const candidates = [];
+      if (window.g_app) {
+        candidates.push(window.g_app);
+      }
+      for (const key of Object.getOwnPropertyNames(window)) {
+        if (key === "window" || key === "self" || key === "globalThis") {
+          continue;
+        }
+        try {
+          const value = window[key];
+          if (value && (typeof value === "object" || typeof value === "function")) {
+            candidates.push(value);
+          }
+        } catch {}
+      }
+      for (const candidate of candidates) {
+        const store =
+          readStoreFromCandidate(candidate) ||
+          readStoreFromCandidate(candidate?.default) ||
+          readStoreFromCandidate(candidate?.a);
+        if (store) {
+          store.dispatch(${payload});
+          return true;
+        }
+      }
+      return false;
+    })();`;
+
+    try {
+      return Boolean(await window.webContents.executeJavaScript(script, true));
+    } catch (error) {
+      logger.warn("[native:tray:dispatch-failed]", error?.message || error);
+      return false;
+    }
+  }
+
+  async function showTrayContextMenu() {
+    if (!trayState.instance || typeof Menu?.buildFromTemplate !== "function") {
+      return false;
+    }
+
+    const info = resolvePlayerInfoObject();
+    const songName = String(info.songName || info.title || "网易云音乐").trim();
+    const artistName = String(info.artistName || "").trim();
+    const menu = Menu.buildFromTemplate([
+      {
+        id: "tray-now-playing",
+        label: artistName ? `${songName} - ${artistName}` : songName,
+        enabled: false
+      },
+      { type: "separator" },
+      {
+        id: "tray-show-main-window",
+        label: "显示主窗口",
+        click: () => {
+          void showMainWindowFromTray();
+        }
+      },
+      {
+        id: "tray-toggle-play",
+        label: isPlayerPlaying() ? "暂停" : "播放",
+        click: () => {
+          void dispatchRendererPlayerAction({
+            type: "playing/switchResumeOrPause",
+            payload: { triggerScene: "tray" }
+          });
+        }
+      },
+      {
+        id: "tray-prev-track",
+        label: "上一首",
+        click: () => {
+          void dispatchRendererPlayerAction({
+            type: "playing/jump2Track",
+            payload: { flag: -1, type: "call", triggerScene: "tray" }
+          });
+        }
+      },
+      {
+        id: "tray-next-track",
+        label: "下一首",
+        click: () => {
+          void dispatchRendererPlayerAction({
+            type: "playing/jump2Track",
+            payload: { flag: 1, type: "call", triggerScene: "tray" }
+          });
+        }
+      },
+      { type: "separator" },
+      {
+        id: "tray-quit",
+        label: "退出",
+        click: () => {
+          appQuitRequested = true;
+          app.quit();
+        }
+      }
+    ]);
+
+    trayState.instance.popUpContextMenu(menu);
+    return true;
+  }
+
+  function shouldRetryNetworkFetch(apiPath = "", url = "", method = "GET") {
+    if (String(method).toUpperCase() === "GET") {
+      return true;
+    }
+    return [
+      "/api/song/enhance/player/url",
+      "/api/song/enhance/player/url/v1",
+      "/api/song/enhance/download/url"
+    ].includes(String(apiPath || "")) || /\/song\/enhance\/player\/url/i.test(url);
+  }
+
+  async function fetchWithRetry(url, options, context = {}) {
+    const { apiPath = "", loggerRef = logger } = context;
+    const maxAttempts = shouldRetryNetworkFetch(apiPath, url, options?.method || "GET") ? 3 : 1;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await fetch(url, options);
+      } catch (error) {
+        lastError = error;
+        loggerRef.warn(
+          "[native:network.fetch:retry]",
+          JSON.stringify({
+            url,
+            apiPath,
+            attempt,
+            maxAttempts,
+            message: error?.message || String(error)
+          })
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
+  function buildPlayerUrlCacheKey(apiPath = "", rpcBody = null) {
+    if (!/\/api\/song\/enhance\/player\/url/i.test(String(apiPath || ""))) {
+      return "";
+    }
+    const payloadObject =
+      rpcBody?.payloadObject && typeof rpcBody.payloadObject === "object"
+        ? rpcBody.payloadObject
+        : {};
+    return JSON.stringify({
+      apiPath,
+      ids: payloadObject.ids || "",
+      level: payloadObject.level || "",
+      encodeType: payloadObject.encodeType || "",
+      trialMode: payloadObject.trialMode ?? "",
+      sourceId: payloadObject.sourceId ?? "",
+      resourceType: payloadObject.resourceType ?? ""
+    });
+  }
+
+  function readCachedPlayerUrlResponse(cacheKey = "") {
+    if (!cacheKey) {
+      return "";
+    }
+    const record = playerUrlResponseCache.get(cacheKey);
+    if (!record || typeof record.text !== "string") {
+      return "";
+    }
+    if (Date.now() - record.time > 10 * 60 * 1000) {
+      playerUrlResponseCache.delete(cacheKey);
+      return "";
+    }
+    return record.text;
+  }
+
+  function storeCachedPlayerUrlResponse(cacheKey = "", text = "") {
+    if (!cacheKey || typeof text !== "string" || !text.trim()) {
+      return;
+    }
+    playerUrlResponseCache.set(cacheKey, {
+      text,
+      time: Date.now()
+    });
+  }
+
+  function shouldProxyAudioUrl(inputUrl = "") {
+    return /^https:\/\/[^/]+\.music\.126\.net(\/|$)/i.test(String(inputUrl || ""));
+  }
+
+  function normalizeProxyRouteToken(token = "") {
+    return String(token || "").replace(/[^a-zA-Z0-9_-]/g, "");
+  }
+
+  function rememberAudioProxyRoute(targetUrl = "") {
+    const token = hashString(`${targetUrl}:${Date.now()}:${Math.random()}`);
+    audioProxyState.routeByToken.set(token, {
+      targetUrl,
+      createdAt: Date.now()
+    });
+    if (audioProxyState.routeByToken.size > 256) {
+      const entries = [...audioProxyState.routeByToken.entries()].sort(
+        (left, right) => left[1].createdAt - right[1].createdAt
+      );
+      for (const [staleToken] of entries.slice(0, entries.length - 256)) {
+        audioProxyState.routeByToken.delete(staleToken);
+      }
+    }
+    return token;
+  }
+
+  async function proxyAudioRequest(request, response) {
+    const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
+    const token = normalizeProxyRouteToken(requestUrl.pathname.replace(/^\/audio\//, ""));
+    const route = audioProxyState.routeByToken.get(token);
+    if (!route?.targetUrl) {
+      response.writeHead(404, {
+        "content-type": "text/plain; charset=utf-8",
+        "access-control-allow-origin": "*"
+      });
+      response.end("audio route not found");
+      return;
+    }
+
+    const targetUrl = route.targetUrl;
+    const headers = {
+      Origin: "https://music.163.com",
+      origin: "https://music.163.com",
+      Referer: "https://music.163.com/",
+      referer: "https://music.163.com/",
+      Accept: request.headers.accept || "audio/*,*/*;q=0.9"
+    };
+    if (request.headers.range) {
+      headers.Range = request.headers.range;
+    }
+    const cookies = await session.defaultSession.cookies.get({ url: targetUrl });
+    if (cookies.length > 0) {
+      headers.Cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+    }
+
+    let upstreamResponse;
+    try {
+      upstreamResponse = await fetchWithRetry(
+        targetUrl,
+        {
+          method: request.method || "GET",
+          headers
+        },
+        {
+          apiPath: "/audio-proxy",
+          loggerRef: logger
+        }
+      );
+    } catch (error) {
+      logger.warn(
+        "[native:audio-proxy:fetch-failed]",
+        JSON.stringify({
+          targetUrl,
+          message: error?.message || String(error)
+        })
+      );
+      response.writeHead(502, {
+        "content-type": "text/plain; charset=utf-8",
+        "access-control-allow-origin": "*"
+      });
+      response.end("audio proxy fetch failed");
+      return;
+    }
+
+    const responseHeaders = {
+      "access-control-allow-origin": "*",
+      "accept-ranges": upstreamResponse.headers.get("accept-ranges") || "bytes",
+      "content-type": upstreamResponse.headers.get("content-type") || "audio/mpeg",
+      "cache-control": upstreamResponse.headers.get("cache-control") || "no-store"
+    };
+    const passthroughHeaderNames = [
+      "content-length",
+      "content-range",
+      "etag",
+      "last-modified"
+    ];
+    for (const headerName of passthroughHeaderNames) {
+      const headerValue = upstreamResponse.headers.get(headerName);
+      if (headerValue) {
+        responseHeaders[headerName] = headerValue;
+      }
+    }
+
+    response.writeHead(upstreamResponse.status, responseHeaders);
+    if (request.method === "HEAD" || !upstreamResponse.body) {
+      response.end();
+      return;
+    }
+
+    Readable.fromWeb(upstreamResponse.body).on("error", (error) => {
+      logger.warn("[native:audio-proxy:stream-error]", error?.message || error);
+      response.destroy(error);
+    }).pipe(response);
+  }
+
+  async function ensureAudioProxyServer() {
+    if (audioProxyState.server && audioProxyState.port) {
+      return audioProxyState.port;
+    }
+    if (audioProxyState.pendingStart) {
+      return audioProxyState.pendingStart;
+    }
+
+    audioProxyState.pendingStart = new Promise((resolve, reject) => {
+      const server = http.createServer((request, response) => {
+        void proxyAudioRequest(request, response);
+      });
+      server.on("error", (error) => {
+        if (audioProxyState.server === server) {
+          audioProxyState.server = null;
+          audioProxyState.port = 0;
+        }
+        reject(error);
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (!address || typeof address !== "object") {
+          reject(new Error("audio proxy listen failed"));
+          return;
+        }
+        audioProxyState.server = server;
+        audioProxyState.port = address.port;
+        resolve(address.port);
+      });
+    }).finally(() => {
+      audioProxyState.pendingStart = null;
+    });
+
+    return audioProxyState.pendingStart;
+  }
+
+  async function resolveAudioProxyUrl(inputUrl = "") {
+    const targetUrl = normalizeAssetUrl(String(inputUrl || ""));
+    if (!shouldProxyAudioUrl(targetUrl)) {
+      return targetUrl;
+    }
+    const port = await ensureAudioProxyServer();
+    const token = rememberAudioProxyRoute(targetUrl);
+    return `http://127.0.0.1:${port}/audio/${token}`;
+  }
+
+  function destroyAudioProxyServer() {
+    if (audioProxyState.server) {
+      audioProxyState.server.close();
+    }
+    audioProxyState.server = null;
+    audioProxyState.port = 0;
+    audioProxyState.pendingStart = null;
+    audioProxyState.routeByToken.clear();
   }
 
   async function executeSqlite(sqlText) {
@@ -1801,6 +2247,7 @@ function createNativeApi(options) {
       hostUserId: String(getPersistedHostSnapshot()?.uid || "")
     }) || decodedRpcBody;
     const apiPath = rpcBody && rpcBody.apiPath ? rpcBody.apiPath : "";
+    const playerUrlCacheKey = buildPlayerUrlCacheKey(apiPath, rpcBody);
     const shouldSyncCookies = isAuthOrVipApiPath(apiPath);
     const options = {
       ...request.options
@@ -1842,16 +2289,29 @@ function createNativeApi(options) {
               : options.body ?? null
       })
     );
-    let activeResponse = await fetch(url, options);
-    if (shouldSyncCookies) {
-      await applyResponseCookies(session.defaultSession.cookies, activeResponse, url, logger);
+    let activeResponse = null;
+    let text = "";
+    let primaryFetchError = null;
+    try {
+      activeResponse = await fetchWithRetry(url, options, {
+        apiPath,
+        loggerRef: logger
+      });
+      if (shouldSyncCookies) {
+        await applyResponseCookies(session.defaultSession.cookies, activeResponse, url, logger);
+      }
+      text = await activeResponse.text();
+    } catch (error) {
+      primaryFetchError = error;
     }
-    let text = await activeResponse.text();
     if (/interfacepc\.music\.163\.com/.test(url)) {
       const emptyPlaceholder = !text.trim()
         ? true
         : text.trim() === "{\"code\":200,\"data\":{},\"message\":\"\"}";
-      const shouldFallback = emptyPlaceholder || shouldForcePublicApiFallback(apiPath, text);
+      const shouldFallback =
+        Boolean(primaryFetchError) ||
+        emptyPlaceholder ||
+        shouldForcePublicApiFallback(apiPath, text);
       if (shouldFallback) {
         let resolvedText = "";
         let resolvedResponse = null;
@@ -1871,66 +2331,111 @@ function createNativeApi(options) {
               fromUrl: url,
               toUrl: publicApiFallback.url,
               apiPath,
-              bodyPreview: publicApiFallback.body.slice(0, 240)
+              bodyPreview: publicApiFallback.body.slice(0, 240),
+              reason: primaryFetchError ? "primary-fetch-error" : "response-fallback"
             })
           );
-          const fallbackResponse = await fetch(publicApiFallback.url, fallbackOptions);
-          if (shouldSyncCookies) {
-            await applyResponseCookies(
-              session.defaultSession.cookies,
-              fallbackResponse,
-              publicApiFallback.url,
-              logger
-            );
-          }
-          const fallbackText = await fallbackResponse.text();
-          const compatibilityFallback = buildCompatibilityFallbackRequest(
-            apiPath,
-            rpcBody && rpcBody.payloadObject ? rpcBody.payloadObject : {}
-          );
-          if (isJsonLikeRpcResponse(fallbackText) && isSuccessfulRpcResponse(fallbackText)) {
-            resolvedText = fallbackText;
-            resolvedResponse = fallbackResponse;
-          } else if (compatibilityFallback) {
-            logger.log(
-              "[native:network.fetch:compat]",
-              JSON.stringify({
-                fromUrl: url,
-                toUrl: compatibilityFallback.url,
-                apiPath,
-                bodyPreview: compatibilityFallback.body.slice(0, 240)
-              })
-            );
-            const compatibilityResponse = await fetch(compatibilityFallback.url, {
-              ...options,
-              body: compatibilityFallback.body
+          try {
+            const fallbackResponse = await fetchWithRetry(publicApiFallback.url, fallbackOptions, {
+              apiPath,
+              loggerRef: logger
             });
             if (shouldSyncCookies) {
               await applyResponseCookies(
                 session.defaultSession.cookies,
-                compatibilityResponse,
-                compatibilityFallback.url,
+                fallbackResponse,
+                publicApiFallback.url,
                 logger
               );
             }
-            const compatibilityText = await compatibilityResponse.text();
-            if (isJsonLikeRpcResponse(compatibilityText)) {
-              resolvedText = compatibilityText;
-              resolvedResponse = compatibilityResponse;
+            const fallbackText = await fallbackResponse.text();
+            const compatibilityFallback = buildCompatibilityFallbackRequest(
+              apiPath,
+              rpcBody && rpcBody.payloadObject ? rpcBody.payloadObject : {}
+            );
+            if (isJsonLikeRpcResponse(fallbackText) && isSuccessfulRpcResponse(fallbackText)) {
+              resolvedText = fallbackText;
+              resolvedResponse = fallbackResponse;
+            } else if (compatibilityFallback) {
+              logger.log(
+                "[native:network.fetch:compat]",
+                JSON.stringify({
+                  fromUrl: url,
+                  toUrl: compatibilityFallback.url,
+                  apiPath,
+                  bodyPreview: compatibilityFallback.body.slice(0, 240)
+                })
+              );
+              const compatibilityResponse = await fetchWithRetry(
+                compatibilityFallback.url,
+                {
+                  ...options,
+                  body: compatibilityFallback.body
+                },
+                {
+                  apiPath,
+                  loggerRef: logger
+                }
+              );
+              if (shouldSyncCookies) {
+                await applyResponseCookies(
+                  session.defaultSession.cookies,
+                  compatibilityResponse,
+                  compatibilityFallback.url,
+                  logger
+                );
+              }
+              const compatibilityText = await compatibilityResponse.text();
+              if (isJsonLikeRpcResponse(compatibilityText)) {
+                resolvedText = compatibilityText;
+                resolvedResponse = compatibilityResponse;
+              }
+            } else if (isJsonLikeRpcResponse(fallbackText)) {
+              resolvedText = fallbackText;
+              resolvedResponse = fallbackResponse;
             }
-          } else if (isJsonLikeRpcResponse(fallbackText)) {
-            resolvedText = fallbackText;
-            resolvedResponse = fallbackResponse;
+          } catch (fallbackError) {
+            logger.warn(
+              "[native:network.fetch:fallback-failed]",
+              JSON.stringify({
+                url: publicApiFallback.url,
+                apiPath,
+                message: fallbackError?.message || String(fallbackError)
+              })
+            );
           }
         }
         if (resolvedResponse) {
           activeResponse = resolvedResponse;
         }
-        text = resolvedText || JSON.stringify(createEmptyRpcResponse(apiPath, url));
+        if (resolvedText) {
+          text = resolvedText;
+        } else {
+          const cachedText = readCachedPlayerUrlResponse(playerUrlCacheKey);
+          if (cachedText) {
+            logger.warn(
+              "[native:network.fetch:cache-hit]",
+              JSON.stringify({
+                apiPath,
+                cacheKey: playerUrlCacheKey
+              })
+            );
+            text = cachedText;
+          } else if (primaryFetchError) {
+            throw primaryFetchError;
+          } else {
+            text = JSON.stringify(createEmptyRpcResponse(apiPath, url));
+          }
+        }
       }
+    } else if (primaryFetchError) {
+      throw primaryFetchError;
     }
     text = maybeRepairUtf8Mojibake(text);
     text = normalizeJsonText(text);
+    if (playerUrlCacheKey && isJsonLikeRpcResponse(text) && isSuccessfulRpcResponse(text)) {
+      storeCachedPlayerUrlResponse(playerUrlCacheKey, text);
+    }
     if (apiPath === "/api/cellphone/existence/check") {
       text = patchCellphoneExistenceResponse(text, rpcBody);
     }
@@ -2366,6 +2871,11 @@ function createNativeApi(options) {
         text
       };
     },
+    "linuxport.resolveaudio": async (payload = {}) => {
+      const rawUrl =
+        payload && typeof payload === "object" ? payload.url || payload.musicurl || "" : "";
+      return resolveAudioProxyUrl(rawUrl);
+    },
     "linuxport.prepareaudio": async (payload = {}) => {
       const rawUrl =
         payload && typeof payload === "object" ? payload.url || payload.musicurl || "" : "";
@@ -2732,7 +3242,7 @@ function createNativeApi(options) {
     "trayicon.settooltip": async (tooltip = "") => {
       trayState.tooltip = String(tooltip || "网易云音乐");
       if (trayState.instance && typeof trayState.instance.setToolTip === "function") {
-        trayState.instance.setToolTip(trayState.tooltip);
+        trayState.instance.setToolTip(getTrayTooltipText());
       }
       return true;
     },
@@ -2780,6 +3290,9 @@ function createNativeApi(options) {
     },
     "player.setinfo": async (...args) => {
       playerRuntimeState.info = normalizeDataValue(args);
+      if (trayState.instance && typeof trayState.instance.setToolTip === "function") {
+        trayState.instance.setToolTip(getTrayTooltipText());
+      }
       return true;
     },
     "player.settotaltime": async (value = 0) => {
@@ -2984,6 +3497,7 @@ function createNativeApi(options) {
     appVersion,
     assetRoot,
     cacheRoot,
+    destroyAudioProxyServer,
     extractedRoot,
     generatedPath,
     initialize: sessionRuntime.initialize,
